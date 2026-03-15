@@ -116,3 +116,26 @@ func TestStdoutSink_EmptyRequest(t *testing.T) {
 		t.Errorf("expected empty output for empty request, got %q", buf.String())
 	}
 }
+
+func TestStdoutSink_CancelledContext(t *testing.T) {
+	var buf bytes.Buffer
+	s := NewStdoutSink(&buf)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately
+
+	err := s.ConsumeMetrics(ctx, &colmetricspb.ExportMetricsServiceRequest{})
+	if err == nil {
+		t.Fatal("expected error from cancelled context")
+	}
+
+	err = s.ConsumeLogs(ctx, &collogspb.ExportLogsServiceRequest{})
+	if err == nil {
+		t.Fatal("expected error from cancelled context")
+	}
+
+	err = s.ConsumeTraces(ctx, &coltracepb.ExportTraceServiceRequest{})
+	if err == nil {
+		t.Fatal("expected error from cancelled context")
+	}
+}

@@ -4,9 +4,10 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
-	"io"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	collogspb "go.opentelemetry.io/proto/otlp/collector/logs/v1"
@@ -15,7 +16,24 @@ import (
 	metricspb "go.opentelemetry.io/proto/otlp/metrics/v1"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
+
+	"github.com/rxbynerd/steeplechase/internal/sink"
 )
+
+// errorSink always returns an error from all Consume methods.
+type errorSink struct{ err error }
+
+func (s *errorSink) ConsumeMetrics(_ context.Context, _ *colmetricspb.ExportMetricsServiceRequest) error {
+	return s.err
+}
+func (s *errorSink) ConsumeLogs(_ context.Context, _ *collogspb.ExportLogsServiceRequest) error {
+	return s.err
+}
+func (s *errorSink) ConsumeTraces(_ context.Context, _ *coltracepb.ExportTraceServiceRequest) error {
+	return s.err
+}
+
+var _ sink.Sink = (*errorSink)(nil)
 
 func newTestHTTPReceiver(s *recordingSink) *HTTPReceiver {
 	return NewHTTPReceiver(":0", s)
@@ -179,5 +197,74 @@ func TestHTTP_Shutdown(t *testing.T) {
 	}
 }
 
-// Verify the recordingSink implements the Sink interface (compile-time check)
-var _ io.Reader = (*bytes.Buffer)(nil) // sanity
+func TestHTTP_SinkConsumeError(t *testing.T) {
+	es := &errorSink{err: errors.New("sink failed")}
+	r := NewHTTPReceiver(":0", es)
+
+	req := &colmetricspb.ExportMetricsServiceRequest{}
+	body, err := proto.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w := httptest.NewRecorder()
+	httpReq := httptest.NewRequest(http.MethodPost, "/v1/metrics", bytes.NewReader(body))
+	httpReq.Header.Set("Content-Type", "application/x-protobuf")
+	r.server.Handler.ServeHTTP(w, httpReq)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("expected 500, got %d", w.Code)
+	}
+}
+
+func TestHTTP_UnmarshalError(t *testing.T) {
+	s := &recordingSink{}
+	r := newTestHTTPReceiver(s)
+
+	w := httptest.NewRecorder()
+	httpReq := httptest.NewRequest(http.MethodPost, "/v1/metrics", bytes.NewReader([]byte("not valid protobuf")))
+	httpReq.Header.Set("Content-Type", "application/x-protobuf")
+	r.server.Handler.ServeHTTP(w, httpReq)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "decode error") {
+		t.Errorf("expected decode error message, got %q", w.Body.String())
+	}
+}
+
+func TestHTTP_OversizedBody(t *testing.T) {
+	s := &recordingSink{}
+	r := newTestHTTPReceiver(s)
+
+	// Create body slightly over 4MB
+	bigBody := make([]byte, maxBodySize+1)
+
+	w := httptest.NewRecorder()
+	httpReq := httptest.NewRequest(http.MethodPost, "/v1/metrics", bytes.NewReader(bigBody))
+	httpReq.Header.Set("Content-Type", "application/x-protobuf")
+	r.server.Handler.ServeHTTP(w, httpReq)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "body exceeds") {
+		t.Errorf("expected body exceeds message, got %q", w.Body.String())
+	}
+}
+
+func TestHTTP_InvalidGzip(t *testing.T) {
+	s := &recordingSink{}
+	r := newTestHTTPReceiver(s)
+
+	w := httptest.NewRecorder()
+	httpReq := httptest.NewRequest(http.MethodPost, "/v1/metrics", bytes.NewReader([]byte("not gzip data")))
+	httpReq.Header.Set("Content-Type", "application/x-protobuf")
+	httpReq.Header.Set("Content-Encoding", "gzip")
+	r.server.Handler.ServeHTTP(w, httpReq)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d", w.Code)
+	}
+}

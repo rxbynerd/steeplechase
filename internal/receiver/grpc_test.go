@@ -2,6 +2,7 @@ package receiver
 
 import (
 	"context"
+	"errors"
 	"net"
 	"testing"
 
@@ -149,5 +150,32 @@ func TestGRPC_ExportTraces(t *testing.T) {
 	}
 	if s.tracesCount != 1 {
 		t.Errorf("expected 1 traces call, got %d", s.tracesCount)
+	}
+}
+
+func TestGRPC_SinkError(t *testing.T) {
+	es := &errorSink{err: errors.New("sink failed")}
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := lis.Addr().String()
+
+	srv := grpc.NewServer()
+	colmetricspb.RegisterMetricsServiceServer(srv, &metricsServer{sink: es})
+	go srv.Serve(lis)
+	defer srv.GracefulStop()
+
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	client := colmetricspb.NewMetricsServiceClient(conn)
+	_, err = client.Export(context.Background(), &colmetricspb.ExportMetricsServiceRequest{})
+	if err == nil {
+		t.Fatal("expected error from sink, got nil")
 	}
 }

@@ -269,3 +269,118 @@ func TestSeverityName(t *testing.T) {
 		}
 	}
 }
+
+func TestFormatMetrics_Summary(t *testing.T) {
+	rm := []*metricspb.ResourceMetrics{{
+		ScopeMetrics: []*metricspb.ScopeMetrics{{
+			Metrics: []*metricspb.Metric{{
+				Name: "test.summary",
+				Data: &metricspb.Metric_Summary{Summary: &metricspb.Summary{
+					DataPoints: []*metricspb.SummaryDataPoint{{
+						TimeUnixNano: 1710504600123000000,
+						Count:        50,
+						Sum:          123.45,
+					}},
+				}},
+			}},
+		}},
+	}}
+
+	lines := FormatMetrics(rm)
+	if len(lines) != 1 {
+		t.Fatalf("expected 1 line, got %d", len(lines))
+	}
+	if !strings.Contains(lines[0], "count=50") {
+		t.Errorf("missing count: %s", lines[0])
+	}
+	if !strings.Contains(lines[0], "sum=123.45") {
+		t.Errorf("missing sum: %s", lines[0])
+	}
+}
+
+func TestFormatMetrics_ExponentialHistogram(t *testing.T) {
+	rm := []*metricspb.ResourceMetrics{{
+		ScopeMetrics: []*metricspb.ScopeMetrics{{
+			Metrics: []*metricspb.Metric{{
+				Name: "test.exp_histogram",
+				Data: &metricspb.Metric_ExponentialHistogram{ExponentialHistogram: &metricspb.ExponentialHistogram{
+					DataPoints: []*metricspb.ExponentialHistogramDataPoint{{
+						TimeUnixNano: 1710504600123000000,
+						Count:        25,
+						Sum:          func() *float64 { v := 99.9; return &v }(),
+					}},
+				}},
+			}},
+		}},
+	}}
+
+	lines := FormatMetrics(rm)
+	if len(lines) != 1 {
+		t.Fatalf("expected 1 line, got %d", len(lines))
+	}
+	if !strings.Contains(lines[0], "count=25") {
+		t.Errorf("missing count: %s", lines[0])
+	}
+	if !strings.Contains(lines[0], "sum=99.9") {
+		t.Errorf("missing sum: %s", lines[0])
+	}
+}
+
+func TestFormatMetrics_NilData(t *testing.T) {
+	rm := []*metricspb.ResourceMetrics{{
+		ScopeMetrics: []*metricspb.ScopeMetrics{{
+			Metrics: []*metricspb.Metric{{
+				Name: "test.nil",
+				Data: nil,
+			}},
+		}},
+	}}
+
+	lines := FormatMetrics(rm)
+	if len(lines) != 1 {
+		t.Fatalf("expected 1 line, got %d", len(lines))
+	}
+	if !strings.Contains(lines[0], "unknown data type") {
+		t.Errorf("expected unknown data type message: %s", lines[0])
+	}
+}
+
+func TestFormatAnyValue_BytesAndKvlist(t *testing.T) {
+	bytesVal := &commonpb.AnyValue{Value: &commonpb.AnyValue_BytesValue{BytesValue: []byte{0xde, 0xad}}}
+	got := FormatAnyValue(bytesVal)
+	if got != "dead" {
+		t.Errorf("BytesValue = %q, want %q", got, "dead")
+	}
+
+	kvlistVal := &commonpb.AnyValue{Value: &commonpb.AnyValue_KvlistValue{KvlistValue: &commonpb.KeyValueList{
+		Values: []*commonpb.KeyValue{
+			{Key: "k", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "v"}}},
+		},
+	}}}
+	got = FormatAnyValue(kvlistVal)
+	if !strings.Contains(got, "k=v") {
+		t.Errorf("KvlistValue = %q, want to contain k=v", got)
+	}
+}
+
+func TestFormatLogs_EventWithBody(t *testing.T) {
+	rl := []*logspb.ResourceLogs{{
+		ScopeLogs: []*logspb.ScopeLogs{{
+			LogRecords: []*logspb.LogRecord{{
+				TimeUnixNano: 1710504600123000000,
+				Attributes: []*commonpb.KeyValue{
+					{Key: "event.name", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "claude_code.user_prompt"}}},
+				},
+				Body: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "hello world"}},
+			}},
+		}},
+	}}
+
+	lines := FormatLogs(rl)
+	if len(lines) != 1 {
+		t.Fatalf("expected 1 line, got %d", len(lines))
+	}
+	if !strings.Contains(lines[0], "body=hello world") {
+		t.Errorf("missing body in event: %s", lines[0])
+	}
+}
