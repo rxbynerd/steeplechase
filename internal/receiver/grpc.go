@@ -23,7 +23,9 @@ type GRPCReceiver struct {
 
 // NewGRPCReceiver creates a gRPC receiver on the given address.
 func NewGRPCReceiver(addr string, s sink.Sink) *GRPCReceiver {
-	srv := grpc.NewServer()
+	srv := grpc.NewServer(
+		grpc.MaxRecvMsgSize(4 * 1024 * 1024), // 4 MB, matching HTTP limit
+	)
 	r := &GRPCReceiver{
 		server: srv,
 		sink:   s,

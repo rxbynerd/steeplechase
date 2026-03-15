@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	collogspb "go.opentelemetry.io/proto/otlp/collector/logs/v1"
 	colmetricspb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
@@ -28,7 +30,13 @@ type HTTPReceiver struct {
 func NewHTTPReceiver(addr string, s sink.Sink) *HTTPReceiver {
 	mux := http.NewServeMux()
 	r := &HTTPReceiver{
-		server: &http.Server{Addr: addr, Handler: mux},
+		server: &http.Server{
+			Addr:         addr,
+			Handler:      mux,
+			ReadTimeout:  10 * time.Second,
+			WriteTimeout: 10 * time.Second,
+			IdleTimeout:  60 * time.Second,
+		},
 		sink:   s,
 	}
 	mux.HandleFunc("/v1/metrics", r.handleMetrics)
@@ -68,6 +76,7 @@ func (r *HTTPReceiver) handleMetrics(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	if err := r.sink.ConsumeMetrics(req.Context(), &msg); err != nil {
+		log.Printf("sink error consuming metrics: %v", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
@@ -93,6 +102,7 @@ func (r *HTTPReceiver) handleLogs(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	if err := r.sink.ConsumeLogs(req.Context(), &msg); err != nil {
+		log.Printf("sink error consuming logs: %v", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
@@ -118,6 +128,7 @@ func (r *HTTPReceiver) handleTraces(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	if err := r.sink.ConsumeTraces(req.Context(), &msg); err != nil {
+		log.Printf("sink error consuming traces: %v", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
@@ -164,7 +175,9 @@ func writeResponse(w http.ResponseWriter, contentType string, msg proto.Message)
 			return
 		}
 		w.WriteHeader(http.StatusOK)
-		w.Write(data)
+		if _, err := w.Write(data); err != nil {
+			log.Printf("failed to write HTTP response: %v", err)
+		}
 		return
 	}
 	w.Header().Set("Content-Type", "application/x-protobuf")
@@ -174,9 +187,12 @@ func writeResponse(w http.ResponseWriter, contentType string, msg proto.Message)
 		return
 	}
 	w.WriteHeader(http.StatusOK)
-	w.Write(data)
+	if _, err := w.Write(data); err != nil {
+		log.Printf("failed to write HTTP response: %v", err)
+	}
 }
 
 func isJSON(contentType string) bool {
-	return strings.Contains(contentType, "json")
+	ct := strings.TrimSpace(strings.SplitN(contentType, ";", 2)[0])
+	return ct == "application/json"
 }

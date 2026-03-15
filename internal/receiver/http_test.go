@@ -85,7 +85,10 @@ func TestHTTP_LogsProtobuf(t *testing.T) {
 	r := newTestHTTPReceiver(s)
 
 	req := &collogspb.ExportLogsServiceRequest{}
-	body, _ := proto.Marshal(req)
+	body, err := proto.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	w := httptest.NewRecorder()
 	httpReq := httptest.NewRequest(http.MethodPost, "/v1/logs", bytes.NewReader(body))
@@ -105,7 +108,10 @@ func TestHTTP_TracesProtobuf(t *testing.T) {
 	r := newTestHTTPReceiver(s)
 
 	req := &coltracepb.ExportTraceServiceRequest{}
-	body, _ := proto.Marshal(req)
+	body, err := proto.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	w := httptest.NewRecorder()
 	httpReq := httptest.NewRequest(http.MethodPost, "/v1/traces", bytes.NewReader(body))
@@ -138,7 +144,10 @@ func TestHTTP_GzipDecompression(t *testing.T) {
 	r := newTestHTTPReceiver(s)
 
 	req := &colmetricspb.ExportMetricsServiceRequest{}
-	body, _ := proto.Marshal(req)
+	body, err := proto.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	var gzBuf bytes.Buffer
 	gw := gzip.NewWriter(&gzBuf)

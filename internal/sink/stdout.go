@@ -13,6 +13,7 @@ import (
 )
 
 // StdoutSink writes formatted telemetry to an io.Writer.
+// It is safe for concurrent use by multiple goroutines.
 type StdoutSink struct {
 	mu sync.Mutex
 	w  io.Writer
@@ -23,28 +24,37 @@ func NewStdoutSink(w io.Writer) *StdoutSink {
 	return &StdoutSink{w: w}
 }
 
-func (s *StdoutSink) ConsumeMetrics(_ context.Context, req *colmetricspb.ExportMetricsServiceRequest) error {
+func (s *StdoutSink) ConsumeMetrics(ctx context.Context, req *colmetricspb.ExportMetricsServiceRequest) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	lines := format.FormatMetrics(req.ResourceMetrics)
-	s.writeLines(lines)
-	return nil
+	return s.writeLines(lines)
 }
 
-func (s *StdoutSink) ConsumeLogs(_ context.Context, req *collogspb.ExportLogsServiceRequest) error {
+func (s *StdoutSink) ConsumeLogs(ctx context.Context, req *collogspb.ExportLogsServiceRequest) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	lines := format.FormatLogs(req.ResourceLogs)
-	s.writeLines(lines)
-	return nil
+	return s.writeLines(lines)
 }
 
-func (s *StdoutSink) ConsumeTraces(_ context.Context, req *coltracepb.ExportTraceServiceRequest) error {
+func (s *StdoutSink) ConsumeTraces(ctx context.Context, req *coltracepb.ExportTraceServiceRequest) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	lines := format.FormatTraces(req.ResourceSpans)
-	s.writeLines(lines)
-	return nil
+	return s.writeLines(lines)
 }
 
-func (s *StdoutSink) writeLines(lines []string) {
+func (s *StdoutSink) writeLines(lines []string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, line := range lines {
-		fmt.Fprintln(s.w, line)
+		if _, err := fmt.Fprintln(s.w, line); err != nil {
+			return fmt.Errorf("write failed: %w", err)
+		}
 	}
+	return nil
 }

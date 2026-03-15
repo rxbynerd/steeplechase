@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -55,14 +56,23 @@ func main() {
 		log.Printf("Receiver error: %v, shutting down...", err)
 	}
 
-	// Graceful shutdown with 5s timeout
+	// Graceful shutdown with 5s timeout, both servers in parallel
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	grpcRecv.Stop()
-	if err := httpRecv.Shutdown(ctx); err != nil {
-		log.Printf("HTTP shutdown error: %v", err)
-	}
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		grpcRecv.Stop()
+	}()
+	go func() {
+		defer wg.Done()
+		if err := httpRecv.Shutdown(ctx); err != nil {
+			log.Printf("HTTP shutdown error: %v", err)
+		}
+	}()
+	wg.Wait()
 
 	log.Println("Shutdown complete")
 }
