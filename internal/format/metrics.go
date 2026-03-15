@@ -2,7 +2,6 @@ package format
 
 import (
 	"fmt"
-	"strings"
 
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	metricspb "go.opentelemetry.io/proto/otlp/metrics/v1"
@@ -132,17 +131,4 @@ func mergeAttributes(resourceAttrs, dataPointAttrs []*commonpb.KeyValue) []*comm
 	}
 	merged = append(merged, dataPointAttrs...)
 	return merged
-}
-
-// FormatMetricsSummary returns a one-line summary of metrics received.
-func FormatMetricsSummary(resourceMetrics []*metricspb.ResourceMetrics) string {
-	var metricNames []string
-	for _, rm := range resourceMetrics {
-		for _, sm := range rm.ScopeMetrics {
-			for _, m := range sm.Metrics {
-				metricNames = append(metricNames, m.Name)
-			}
-		}
-	}
-	return fmt.Sprintf("Received %d metric(s): %s", len(metricNames), strings.Join(metricNames, ", "))
 }
