@@ -11,6 +11,7 @@ import (
 	"google.golang.org/grpc"
 	_ "google.golang.org/grpc/encoding/gzip" // register gzip compressor
 
+	"github.com/rxbynerd/steeplechase/internal/metrics"
 	"github.com/rxbynerd/steeplechase/internal/sink"
 )
 
@@ -21,8 +22,9 @@ type GRPCReceiver struct {
 	addr   string
 }
 
-// NewGRPCReceiver creates a gRPC receiver on the given address.
-func NewGRPCReceiver(addr string, s sink.Sink) *GRPCReceiver {
+// NewGRPCReceiver creates a gRPC receiver on the given address. If rec is
+// non-nil, each accepted request is counted via ObserveReceive.
+func NewGRPCReceiver(addr string, s sink.Sink, rec *metrics.Recorder) *GRPCReceiver {
 	srv := grpc.NewServer(
 		grpc.MaxRecvMsgSize(4 * 1024 * 1024), // 4 MB, matching HTTP limit
 	)
@@ -31,11 +33,14 @@ func NewGRPCReceiver(addr string, s sink.Sink) *GRPCReceiver {
 		sink:   s,
 		addr:   addr,
 	}
-	colmetricspb.RegisterMetricsServiceServer(srv, &metricsServer{sink: s})
-	collogspb.RegisterLogsServiceServer(srv, &logsServer{sink: s})
-	coltracepb.RegisterTraceServiceServer(srv, &traceServer{sink: s})
+	colmetricspb.RegisterMetricsServiceServer(srv, &metricsServer{sink: s, rec: rec})
+	collogspb.RegisterLogsServiceServer(srv, &logsServer{sink: s, rec: rec})
+	coltracepb.RegisterTraceServiceServer(srv, &traceServer{sink: s, rec: rec})
 	return r
 }
+
+// SinkName returns the name of the configured sink, useful for startup logs.
+func (r *GRPCReceiver) SinkName() string { return r.sink.Name() }
 
 // Start begins listening. Blocks until the server stops.
 func (r *GRPCReceiver) Start() error {
@@ -55,9 +60,13 @@ func (r *GRPCReceiver) Stop() {
 type metricsServer struct {
 	colmetricspb.UnimplementedMetricsServiceServer
 	sink sink.Sink
+	rec  *metrics.Recorder
 }
 
 func (s *metricsServer) Export(ctx context.Context, req *colmetricspb.ExportMetricsServiceRequest) (*colmetricspb.ExportMetricsServiceResponse, error) {
+	if s.rec != nil {
+		s.rec.ObserveReceive("grpc", metrics.SignalMetrics)
+	}
 	if err := s.sink.ConsumeMetrics(ctx, req); err != nil {
 		return nil, err
 	}
@@ -68,9 +77,13 @@ func (s *metricsServer) Export(ctx context.Context, req *colmetricspb.ExportMetr
 type logsServer struct {
 	collogspb.UnimplementedLogsServiceServer
 	sink sink.Sink
+	rec  *metrics.Recorder
 }
 
 func (s *logsServer) Export(ctx context.Context, req *collogspb.ExportLogsServiceRequest) (*collogspb.ExportLogsServiceResponse, error) {
+	if s.rec != nil {
+		s.rec.ObserveReceive("grpc", metrics.SignalLogs)
+	}
 	if err := s.sink.ConsumeLogs(ctx, req); err != nil {
 		return nil, err
 	}
@@ -81,9 +94,13 @@ func (s *logsServer) Export(ctx context.Context, req *collogspb.ExportLogsServic
 type traceServer struct {
 	coltracepb.UnimplementedTraceServiceServer
 	sink sink.Sink
+	rec  *metrics.Recorder
 }
 
 func (s *traceServer) Export(ctx context.Context, req *coltracepb.ExportTraceServiceRequest) (*coltracepb.ExportTraceServiceResponse, error) {
+	if s.rec != nil {
+		s.rec.ObserveReceive("grpc", metrics.SignalTraces)
+	}
 	if err := s.sink.ConsumeTraces(ctx, req); err != nil {
 		return nil, err
 	}

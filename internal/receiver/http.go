@@ -15,6 +15,7 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/rxbynerd/steeplechase/internal/metrics"
 	"github.com/rxbynerd/steeplechase/internal/sink"
 )
 
@@ -24,10 +25,12 @@ const maxBodySize = 4 * 1024 * 1024 // 4 MB
 type HTTPReceiver struct {
 	server *http.Server
 	sink   sink.Sink
+	rec    *metrics.Recorder
 }
 
-// NewHTTPReceiver creates an HTTP receiver on the given address.
-func NewHTTPReceiver(addr string, s sink.Sink) *HTTPReceiver {
+// NewHTTPReceiver creates an HTTP receiver on the given address. If rec is
+// non-nil, each accepted request is counted via ObserveReceive.
+func NewHTTPReceiver(addr string, s sink.Sink, rec *metrics.Recorder) *HTTPReceiver {
 	mux := http.NewServeMux()
 	r := &HTTPReceiver{
 		server: &http.Server{
@@ -37,13 +40,17 @@ func NewHTTPReceiver(addr string, s sink.Sink) *HTTPReceiver {
 			WriteTimeout: 10 * time.Second,
 			IdleTimeout:  60 * time.Second,
 		},
-		sink:   s,
+		sink: s,
+		rec:  rec,
 	}
 	mux.HandleFunc("/v1/metrics", r.handleMetrics)
 	mux.HandleFunc("/v1/logs", r.handleLogs)
 	mux.HandleFunc("/v1/traces", r.handleTraces)
 	return r
 }
+
+// SinkName returns the name of the configured sink, useful for startup logs.
+func (r *HTTPReceiver) SinkName() string { return r.sink.Name() }
 
 // Start begins listening. Blocks until the server stops.
 func (r *HTTPReceiver) Start() error {
@@ -63,6 +70,9 @@ func (r *HTTPReceiver) handleMetrics(w http.ResponseWriter, req *http.Request) {
 	if req.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
+	}
+	if r.rec != nil {
+		r.rec.ObserveReceive("http", metrics.SignalMetrics)
 	}
 	body, ct, err := readBody(req)
 	if err != nil {
@@ -90,6 +100,9 @@ func (r *HTTPReceiver) handleLogs(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	if r.rec != nil {
+		r.rec.ObserveReceive("http", metrics.SignalLogs)
+	}
 	body, ct, err := readBody(req)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -115,6 +128,9 @@ func (r *HTTPReceiver) handleTraces(w http.ResponseWriter, req *http.Request) {
 	if req.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
+	}
+	if r.rec != nil {
+		r.rec.ObserveReceive("http", metrics.SignalTraces)
 	}
 	body, ct, err := readBody(req)
 	if err != nil {

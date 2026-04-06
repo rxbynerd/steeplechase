@@ -17,30 +17,15 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/rxbynerd/steeplechase/internal/sink"
+	"github.com/rxbynerd/steeplechase/internal/sinktest"
 )
 
-// errorSink always returns an error from all Consume methods.
-type errorSink struct{ err error }
-
-func (s *errorSink) ConsumeMetrics(_ context.Context, _ *colmetricspb.ExportMetricsServiceRequest) error {
-	return s.err
-}
-func (s *errorSink) ConsumeLogs(_ context.Context, _ *collogspb.ExportLogsServiceRequest) error {
-	return s.err
-}
-func (s *errorSink) ConsumeTraces(_ context.Context, _ *coltracepb.ExportTraceServiceRequest) error {
-	return s.err
-}
-
-var _ sink.Sink = (*errorSink)(nil)
-
-func newTestHTTPReceiver(s *recordingSink) *HTTPReceiver {
-	return NewHTTPReceiver(":0", s)
+func newTestHTTPReceiver(s *sinktest.RecordingSink) *HTTPReceiver {
+	return NewHTTPReceiver(":0", s, nil)
 }
 
 func TestHTTP_MetricsProtobuf(t *testing.T) {
-	s := &recordingSink{}
+	s := sinktest.NewRecordingSink("test")
 	r := newTestHTTPReceiver(s)
 
 	req := &colmetricspb.ExportMetricsServiceRequest{
@@ -70,13 +55,13 @@ func TestHTTP_MetricsProtobuf(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Errorf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
-	if s.metricsCount != 1 {
-		t.Errorf("expected 1 metrics call, got %d", s.metricsCount)
+	if s.MetricsCount() != 1 {
+		t.Errorf("expected 1 metrics call, got %d", s.MetricsCount())
 	}
 }
 
 func TestHTTP_MetricsJSON(t *testing.T) {
-	s := &recordingSink{}
+	s := sinktest.NewRecordingSink("test")
 	r := newTestHTTPReceiver(s)
 
 	req := &colmetricspb.ExportMetricsServiceRequest{}
@@ -99,7 +84,7 @@ func TestHTTP_MetricsJSON(t *testing.T) {
 }
 
 func TestHTTP_LogsProtobuf(t *testing.T) {
-	s := &recordingSink{}
+	s := sinktest.NewRecordingSink("test")
 	r := newTestHTTPReceiver(s)
 
 	req := &collogspb.ExportLogsServiceRequest{}
@@ -116,13 +101,13 @@ func TestHTTP_LogsProtobuf(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Errorf("expected 200, got %d", w.Code)
 	}
-	if s.logsCount != 1 {
-		t.Errorf("expected 1 logs call, got %d", s.logsCount)
+	if s.LogsCount() != 1 {
+		t.Errorf("expected 1 logs call, got %d", s.LogsCount())
 	}
 }
 
 func TestHTTP_TracesProtobuf(t *testing.T) {
-	s := &recordingSink{}
+	s := sinktest.NewRecordingSink("test")
 	r := newTestHTTPReceiver(s)
 
 	req := &coltracepb.ExportTraceServiceRequest{}
@@ -139,13 +124,13 @@ func TestHTTP_TracesProtobuf(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Errorf("expected 200, got %d", w.Code)
 	}
-	if s.tracesCount != 1 {
-		t.Errorf("expected 1 traces call, got %d", s.tracesCount)
+	if s.TracesCount() != 1 {
+		t.Errorf("expected 1 traces call, got %d", s.TracesCount())
 	}
 }
 
 func TestHTTP_MethodNotAllowed(t *testing.T) {
-	s := &recordingSink{}
+	s := sinktest.NewRecordingSink("test")
 	r := newTestHTTPReceiver(s)
 
 	w := httptest.NewRecorder()
@@ -158,7 +143,7 @@ func TestHTTP_MethodNotAllowed(t *testing.T) {
 }
 
 func TestHTTP_GzipDecompression(t *testing.T) {
-	s := &recordingSink{}
+	s := sinktest.NewRecordingSink("test")
 	r := newTestHTTPReceiver(s)
 
 	req := &colmetricspb.ExportMetricsServiceRequest{}
@@ -184,8 +169,8 @@ func TestHTTP_GzipDecompression(t *testing.T) {
 }
 
 func TestHTTP_Shutdown(t *testing.T) {
-	s := &recordingSink{}
-	r := NewHTTPReceiver("127.0.0.1:0", s)
+	s := sinktest.NewRecordingSink("test")
+	r := NewHTTPReceiver("127.0.0.1:0", s, nil)
 
 	// Start in background
 	go r.Start()
@@ -198,8 +183,8 @@ func TestHTTP_Shutdown(t *testing.T) {
 }
 
 func TestHTTP_SinkConsumeError(t *testing.T) {
-	es := &errorSink{err: errors.New("sink failed")}
-	r := NewHTTPReceiver(":0", es)
+	es := sinktest.NewErrorSink("err", errors.New("sink failed"))
+	r := NewHTTPReceiver(":0", es, nil)
 
 	req := &colmetricspb.ExportMetricsServiceRequest{}
 	body, err := proto.Marshal(req)
@@ -218,7 +203,7 @@ func TestHTTP_SinkConsumeError(t *testing.T) {
 }
 
 func TestHTTP_UnmarshalError(t *testing.T) {
-	s := &recordingSink{}
+	s := sinktest.NewRecordingSink("test")
 	r := newTestHTTPReceiver(s)
 
 	w := httptest.NewRecorder()
@@ -235,7 +220,7 @@ func TestHTTP_UnmarshalError(t *testing.T) {
 }
 
 func TestHTTP_OversizedBody(t *testing.T) {
-	s := &recordingSink{}
+	s := sinktest.NewRecordingSink("test")
 	r := newTestHTTPReceiver(s)
 
 	// Create body slightly over 4MB
@@ -255,7 +240,7 @@ func TestHTTP_OversizedBody(t *testing.T) {
 }
 
 func TestHTTP_InvalidGzip(t *testing.T) {
-	s := &recordingSink{}
+	s := sinktest.NewRecordingSink("test")
 	r := newTestHTTPReceiver(s)
 
 	w := httptest.NewRecorder()

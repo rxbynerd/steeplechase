@@ -15,30 +15,11 @@ import (
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+
+	"github.com/rxbynerd/steeplechase/internal/sinktest"
 )
 
-type recordingSink struct {
-	metricsCount int
-	logsCount    int
-	tracesCount  int
-}
-
-func (s *recordingSink) ConsumeMetrics(_ context.Context, req *colmetricspb.ExportMetricsServiceRequest) error {
-	s.metricsCount++
-	return nil
-}
-
-func (s *recordingSink) ConsumeLogs(_ context.Context, req *collogspb.ExportLogsServiceRequest) error {
-	s.logsCount++
-	return nil
-}
-
-func (s *recordingSink) ConsumeTraces(_ context.Context, req *coltracepb.ExportTraceServiceRequest) error {
-	s.tracesCount++
-	return nil
-}
-
-func startTestGRPCServer(t *testing.T, s *recordingSink) (string, func()) {
+func startTestGRPCServer(t *testing.T, s *sinktest.RecordingSink) (string, func()) {
 	t.Helper()
 	// Use a random available port
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
@@ -56,8 +37,9 @@ func startTestGRPCServer(t *testing.T, s *recordingSink) (string, func()) {
 	return addr, srv.GracefulStop
 }
 
+
 func TestGRPC_ExportMetrics(t *testing.T) {
-	s := &recordingSink{}
+	s := sinktest.NewRecordingSink("test")
 	addr, stop := startTestGRPCServer(t, s)
 	defer stop()
 
@@ -85,13 +67,13 @@ func TestGRPC_ExportMetrics(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Export metrics: %v", err)
 	}
-	if s.metricsCount != 1 {
-		t.Errorf("expected 1 metrics call, got %d", s.metricsCount)
+	if s.MetricsCount() != 1 {
+		t.Errorf("expected 1 metrics call, got %d", s.MetricsCount())
 	}
 }
 
 func TestGRPC_ExportLogs(t *testing.T) {
-	s := &recordingSink{}
+	s := sinktest.NewRecordingSink("test")
 	addr, stop := startTestGRPCServer(t, s)
 	defer stop()
 
@@ -117,13 +99,13 @@ func TestGRPC_ExportLogs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Export logs: %v", err)
 	}
-	if s.logsCount != 1 {
-		t.Errorf("expected 1 logs call, got %d", s.logsCount)
+	if s.LogsCount() != 1 {
+		t.Errorf("expected 1 logs call, got %d", s.LogsCount())
 	}
 }
 
 func TestGRPC_ExportTraces(t *testing.T) {
-	s := &recordingSink{}
+	s := sinktest.NewRecordingSink("test")
 	addr, stop := startTestGRPCServer(t, s)
 	defer stop()
 
@@ -148,13 +130,13 @@ func TestGRPC_ExportTraces(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Export traces: %v", err)
 	}
-	if s.tracesCount != 1 {
-		t.Errorf("expected 1 traces call, got %d", s.tracesCount)
+	if s.TracesCount() != 1 {
+		t.Errorf("expected 1 traces call, got %d", s.TracesCount())
 	}
 }
 
 func TestGRPC_SinkError(t *testing.T) {
-	es := &errorSink{err: errors.New("sink failed")}
+	es := sinktest.NewErrorSink("err", errors.New("sink failed"))
 
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
