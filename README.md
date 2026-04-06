@@ -1,14 +1,22 @@
 # Steeplechase
 
-A lightweight OTLP collector that captures all OpenTelemetry telemetry from Claude Code and prints it to STDOUT.
+A lightweight OTLP router for Claude Code telemetry. Receives OpenTelemetry metrics, logs, and traces on the standard OTLP ports and fans them out to one or more destinations: stdout, another OTLP backend, or any combination.
 
-Designed for full-fidelity local capture with future forwarding to aggregation backends (Redis TimeSeries, AWS).
+Single Go binary, no OTel Collector SDK.
 
 ## Quick Start
 
 ```bash
 make build
-./bin/steeplechase
+./bin/steeplechase                    # defaults to a single stdout sink
+```
+
+Forward to another OTLP backend while also printing locally:
+
+```bash
+./bin/steeplechase \
+  --sink stdout \
+  --sink 'otlp+grpc://vector.internal:4317?compression=gzip&header=x-api-key:secret'
 ```
 
 Configure Claude Code to send telemetry:
@@ -33,10 +41,67 @@ export OTEL_METRIC_EXPORT_INTERVAL=10000
 ## Flags
 
 ```
---grpc-addr  gRPC listen address (default :4317)
---http-addr  HTTP listen address (default :4318)
---version    Print version and exit
+--grpc-addr   gRPC listen address (default :4317)
+--http-addr   HTTP listen address (default :4318)
+--admin-addr  Admin listener for /healthz, /readyz, /metrics (default :9090)
+--sink        Sink DSN, repeatable. Defaults to stdout if none given.
+--version     Print version and exit
 ```
+
+## Routing
+
+Every configured `--sink` receives every OTLP payload in parallel. Per-sink failures are logged with structured context and exposed as metrics, but they do not propagate back to the upstream client unless *every* sink fails. This best-effort policy prevents a single flaky backend from triggering upstream retries that would duplicate data at the healthy sinks.
+
+### Sink DSN format
+
+```
+stdout                                         # write to process stdout
+otlp+grpc://HOST:PORT[?k=v&...]                # forward over OTLP gRPC
+otlp+http://HOST:PORT[/BASE][?k=v&...]         # forward over OTLP HTTP (plaintext)
+otlp+https://HOST:PORT[/BASE][?k=v&...]        # forward over OTLP HTTP with TLS
+```
+
+Query parameters (all optional):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `name` | `host:port` | Label used in logs and Prometheus metrics |
+| `tls` | off for grpc, on for https | `true`, `false`, or `insecure` (skip verify) |
+| `ca` | — | Path to a PEM CA bundle |
+| `header` | — | Outbound header, format `key:value`; repeatable |
+| `timeout` | `10s` | Per-call deadline |
+| `compression` | `gzip` (grpc), `none` (http) | `gzip` or `none` |
+| `retry_initial` | `500ms` | First backoff interval |
+| `retry_max_interval` | `10s` | Cap on any single backoff |
+| `retry_max_elapsed` | `30s` | Total retry budget per call |
+| `keepalive` | off | gRPC client keepalive ping interval |
+
+Unknown query keys cause startup to fail loudly, so typos become hard errors instead of silently-dropped configuration.
+
+## Admin Endpoints
+
+A dedicated listener (default `:9090`) exposes:
+
+| Path | Behaviour |
+|---|---|
+| `GET /healthz` | Always 200 while the process is alive (liveness probe). |
+| `GET /readyz` | 200 once startup completes; 503 during shutdown so load balancers can drain. |
+| `GET /metrics` | Prometheus text format. |
+
+### Exported metrics
+
+| Metric | Labels | Type |
+|---|---|---|
+| `steeplechase_receiver_accept_total` | receiver, signal | counter |
+| `steeplechase_sink_receive_total` | sink, signal | counter |
+| `steeplechase_sink_success_total` | sink, signal | counter |
+| `steeplechase_sink_failure_total` | sink, signal, reason | counter |
+| `steeplechase_sink_latency_seconds` | sink, signal | histogram |
+| `steeplechase_sink_retries_total` | sink, signal | counter |
+| `steeplechase_sink_inflight` | sink, signal | gauge |
+| `steeplechase_build_info` | version | gauge |
+
+`reason` is drawn from a closed label set: `timeout`, `canceled`, `permanent`, `other`.
 
 ## Output Format
 
@@ -66,5 +131,5 @@ make all     # vet + test + build
 
 ```bash
 docker build -t steeplechase .
-docker run -p 4317:4317 -p 4318:4318 steeplechase
+docker run -p 4317:4317 -p 4318:4318 -p 9090:9090 steeplechase
 ```

@@ -1,6 +1,6 @@
 # Steeplechase
 
-Lightweight OTLP collector for Claude Code telemetry. Single Go binary, no OTel Collector SDK.
+Lightweight OTLP router for Claude Code telemetry. Single Go binary, no OTel Collector SDK. Receives OTLP on :4317/:4318 and fans each payload out to one or more configured sinks (stdout, OTLP gRPC, OTLP HTTP).
 
 ## Build & Test
 
@@ -13,18 +13,32 @@ go mod tidy       # After dependency changes
 
 ## Project Structure
 
-- `cmd/steeplechase/main.go` - CLI entrypoint, flag parsing, signal handling
-- `internal/sink/sink.go` - Sink interface (ConsumeMetrics, ConsumeLogs, ConsumeTraces)
+- `cmd/steeplechase/main.go` - CLI entrypoint, flag parsing, pipeline construction, signal-driven shutdown
+- `internal/sink/sink.go` - Sink interface (`ConsumeMetrics`, `ConsumeLogs`, `ConsumeTraces`, `Name`, `Shutdown`)
 - `internal/sink/stdout.go` - StdoutSink: mutex-serialized writes to io.Writer
-- `internal/receiver/grpc.go` - gRPC server on :4317
-- `internal/receiver/http.go` - HTTP server on :4318 (protobuf + JSON)
+- `internal/sink/fanout.go` - FanoutSink: parallel best-effort fan-out with slog per-child failure logging
+- `internal/sink/metered.go` - MeteredSink: wraps any Sink and observes Prometheus metrics
+- `internal/sink/otlp_forward.go` - OTLPForwardSink + transport interface
+- `internal/sink/otlp_forward_grpc.go` - gRPC transport (TLS, gzip, headers, keepalive)
+- `internal/sink/otlp_forward_http.go` - HTTP transport (TLS, gzip, headers, retry classification)
+- `internal/sink/retry.go` - Exponential backoff + `permanentError` sentinel
+- `internal/sink/dsn.go` - `ParseDSN` for `stdout`, `otlp+grpc://`, `otlp+http://`, `otlp+https://`
+- `internal/sinktest/` - Shared test fakes: `RecordingSink`, `ErrorSink`, `SlowSink`
+- `internal/receiver/grpc.go` - gRPC server on :4317, observes receiver metrics
+- `internal/receiver/http.go` - HTTP server on :4318 (protobuf + JSON), observes receiver metrics
 - `internal/receiver/decompress.go` - gzip decompression for HTTP
-- `internal/format/` - Human-readable formatting for metrics, logs, traces
+- `internal/metrics/` - Prometheus `Recorder` (sink + receiver counters, histograms, gauges)
+- `internal/admin/` - Admin HTTP server: `/healthz`, `/readyz`, `/metrics`
+- `internal/format/` - Human-readable formatting for metrics, logs, traces (used by StdoutSink)
 
 ## Conventions
 
 - Go module: `github.com/rxbynerd/steeplechase`
 - Sink interface takes full proto request objects, not extracted fields
+- Sinks must be safe for concurrent use; `Name()` returns the metric/log label; `Shutdown()` releases resources
+- Fan-out is best-effort: FanoutSink returns nil unless every child fails, keeping upstream retries from duplicating into healthy sinks
 - HTTP Content-Type dispatch: `application/x-protobuf` or `application/json`
-- Version baked in via `-ldflags "-X main.version=..."`
-- Tests use `*_test.go` convention alongside source files
+- DSN is the configuration surface. If options grow beyond what CLI flags handle, use TOML or HCLv2, **not** YAML or JSON
+- Prometheus registry and `metrics.Recorder` are constructed in `main` and passed into receivers and `MeteredSink` wrappers; avoid global registries
+- Version baked in via `-ldflags "-X main.version=..."` and surfaced as `steeplechase_build_info{version}`
+- Tests use `*_test.go` convention alongside source files; routing-sink tests use `package sink_test` to avoid an import cycle with `internal/sinktest`
