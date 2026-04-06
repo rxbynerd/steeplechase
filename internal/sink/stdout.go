@@ -24,6 +24,12 @@ func NewStdoutSink(w io.Writer) *StdoutSink {
 	return &StdoutSink{w: w}
 }
 
+// Name returns the sink's identifier for use in log and metric labels.
+func (s *StdoutSink) Name() string { return "stdout" }
+
+// Shutdown is a no-op for StdoutSink; the underlying writer is owned by the caller.
+func (s *StdoutSink) Shutdown(_ context.Context) error { return nil }
+
 func (s *StdoutSink) ConsumeMetrics(ctx context.Context, req *colmetricspb.ExportMetricsServiceRequest) error {
 	if err := ctx.Err(); err != nil {
 		return err
