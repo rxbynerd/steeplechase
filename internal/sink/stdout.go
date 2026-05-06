@@ -64,3 +64,18 @@ func (s *StdoutSink) writeLines(lines []string) error {
 	}
 	return nil
 }
+
+// writeRunBlockLines satisfies the linesWriter contract used by RunBlockSink.
+// It funnels rendered run-block lines through the same mutex-serialised
+// writeLines path that line-mode emissions use, so a buffered flush cannot
+// interleave with a concurrent line-mode write to the same writer.
+//
+// Lock order: callers (RunBlockSink) hold RunBlockSink.mu; this method
+// acquires StdoutSink.mu internally. The order is therefore
+// RunBlockSink.mu -> StdoutSink.mu and must never be inverted.
+func (s *StdoutSink) writeRunBlockLines(_ context.Context, lines []string) error {
+	if err := s.writeLines(lines); err != nil {
+		return fmt.Errorf("runblock write: %w", err)
+	}
+	return nil
+}

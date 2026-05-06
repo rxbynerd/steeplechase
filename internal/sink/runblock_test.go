@@ -79,6 +79,19 @@ func stringAttr(k, v string) *commonpb.KeyValue {
 	return &commonpb.KeyValue{Key: k, Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: v}}}
 }
 
+// mustNewRunBlockSink wraps the constructor for the common test case where
+// passing *StdoutSink as inner is guaranteed to succeed. Tests that want
+// to exercise the construction error path call sink.NewRunBlockSink
+// directly.
+func mustNewRunBlockSink(t *testing.T, inner sink.Sink, cfg sink.RunBlockConfig) *sink.RunBlockSink {
+	t.Helper()
+	rb, err := sink.NewRunBlockSink(inner, cfg)
+	if err != nil {
+		t.Fatalf("NewRunBlockSink: %v", err)
+	}
+	return rb
+}
+
 // makeRootRunSpan returns the canonical Stirrup root span for a run.
 func makeRootRunSpan(traceID, spanID []byte, ts uint64, runID string, attrs ...*commonpb.KeyValue) *tracepb.Span {
 	a := []*commonpb.KeyValue{stringAttr("run.id", runID)}
@@ -148,7 +161,7 @@ func TestRunBlock_HappyPath_RootEndFlushes(t *testing.T) {
 	var buf bytes.Buffer
 	stdout := sink.NewStdoutSink(&buf)
 	clock := newFakeClock(time.Unix(0, 1710504600000000000))
-	rb := sink.NewRunBlockSink(stdout, sink.RunBlockConfig{
+	rb := mustNewRunBlockSink(t, stdout, sink.RunBlockConfig{
 		Mode:        sink.RunBlockModeGrouped,
 		IdleTimeout: time.Hour,
 		MaxItems:    100,
@@ -209,7 +222,7 @@ func TestRunBlock_NoRunIDBypasses(t *testing.T) {
 	var buf bytes.Buffer
 	stdout := sink.NewStdoutSink(&buf)
 	clock := newFakeClock(time.Unix(0, 1710504600000000000))
-	rb := sink.NewRunBlockSink(stdout, sink.RunBlockConfig{
+	rb := mustNewRunBlockSink(t, stdout, sink.RunBlockConfig{
 		Mode:        sink.RunBlockModeGrouped,
 		IdleTimeout: time.Hour,
 		Clock:       clock,
@@ -239,7 +252,7 @@ func TestRunBlock_IdleTimeoutFlushes(t *testing.T) {
 	buf := &syncBuffer{}
 	stdout := sink.NewStdoutSink(buf)
 	clock := newFakeClock(time.Unix(0, 1710504600000000000))
-	rb := sink.NewRunBlockSink(stdout, sink.RunBlockConfig{
+	rb := mustNewRunBlockSink(t, stdout, sink.RunBlockConfig{
 		Mode: sink.RunBlockModeGrouped,
 		// Short timeout so the sweeper polls at the 100ms floor.
 		IdleTimeout: 200 * time.Millisecond,
@@ -287,7 +300,7 @@ func TestRunBlock_OverflowTruncatesAndStreams(t *testing.T) {
 	var buf bytes.Buffer
 	stdout := sink.NewStdoutSink(&buf)
 	clock := newFakeClock(time.Unix(0, 1710504600000000000))
-	rb := sink.NewRunBlockSink(stdout, sink.RunBlockConfig{
+	rb := mustNewRunBlockSink(t, stdout, sink.RunBlockConfig{
 		Mode:        sink.RunBlockModeGrouped,
 		IdleTimeout: time.Hour,
 		MaxItems:    2,
@@ -324,7 +337,7 @@ func TestRunBlock_ShutdownFlushesOpenRuns(t *testing.T) {
 	var buf bytes.Buffer
 	stdout := sink.NewStdoutSink(&buf)
 	clock := newFakeClock(time.Unix(0, 1710504600000000000))
-	rb := sink.NewRunBlockSink(stdout, sink.RunBlockConfig{
+	rb := mustNewRunBlockSink(t, stdout, sink.RunBlockConfig{
 		Mode:        sink.RunBlockModeGrouped,
 		IdleTimeout: time.Hour,
 		MaxItems:    100,
@@ -357,7 +370,7 @@ func TestRunBlock_TraceIDMappingForChildSpans(t *testing.T) {
 	var buf bytes.Buffer
 	stdout := sink.NewStdoutSink(&buf)
 	clock := newFakeClock(time.Unix(0, 1710504600000000000))
-	rb := sink.NewRunBlockSink(stdout, sink.RunBlockConfig{
+	rb := mustNewRunBlockSink(t, stdout, sink.RunBlockConfig{
 		Mode:        sink.RunBlockModeGrouped,
 		IdleTimeout: time.Hour,
 		MaxItems:    100,
@@ -405,7 +418,7 @@ func TestRunBlock_LogsAndMetrics(t *testing.T) {
 	var buf bytes.Buffer
 	stdout := sink.NewStdoutSink(&buf)
 	clock := newFakeClock(time.Unix(0, 1710504600000000000))
-	rb := sink.NewRunBlockSink(stdout, sink.RunBlockConfig{
+	rb := mustNewRunBlockSink(t, stdout, sink.RunBlockConfig{
 		Mode:        sink.RunBlockModeGrouped,
 		IdleTimeout: time.Hour,
 		MaxItems:    100,
@@ -455,7 +468,7 @@ func TestRunBlock_LogWithoutRunIDBypasses(t *testing.T) {
 	var buf bytes.Buffer
 	stdout := sink.NewStdoutSink(&buf)
 	clock := newFakeClock(time.Unix(0, 1710504600000000000))
-	rb := sink.NewRunBlockSink(stdout, sink.RunBlockConfig{
+	rb := mustNewRunBlockSink(t, stdout, sink.RunBlockConfig{
 		Mode:        sink.RunBlockModeGrouped,
 		IdleTimeout: time.Hour,
 		Clock:       clock,
@@ -486,7 +499,7 @@ func TestRunBlock_ConcurrentUseRaceFree(t *testing.T) {
 	buf := &syncBuffer{}
 	stdout := sink.NewStdoutSink(buf)
 	clock := newFakeClock(time.Unix(0, 1710504600000000000))
-	rb := sink.NewRunBlockSink(stdout, sink.RunBlockConfig{
+	rb := mustNewRunBlockSink(t, stdout, sink.RunBlockConfig{
 		Mode:        sink.RunBlockModeGrouped,
 		IdleTimeout: time.Hour,
 		MaxItems:    1000,
@@ -538,7 +551,7 @@ func TestRunBlock_ConcurrentUseRaceFree(t *testing.T) {
 
 func TestRunBlock_NameDelegatesToInner(t *testing.T) {
 	stdout := sink.NewStdoutSink(&bytes.Buffer{})
-	rb := sink.NewRunBlockSink(stdout, sink.RunBlockConfig{
+	rb := mustNewRunBlockSink(t, stdout, sink.RunBlockConfig{
 		Mode:        sink.RunBlockModeGrouped,
 		IdleTimeout: time.Hour,
 	})

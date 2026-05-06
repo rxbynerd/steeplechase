@@ -188,10 +188,19 @@ func buildPipeline(dsns []string, rec *metrics.Recorder, logger *slog.Logger, st
 	var leaves []sink.Sink
 	var names []string
 
-	maybeWrap := func(s sink.Sink) sink.Sink {
+	// teardown releases any sinks already constructed if a later one fails
+	// to construct, so we don't leak goroutines (e.g. RunBlockSink's idle
+	// sweeper) on the error path.
+	teardown := func() {
+		for _, l := range leaves {
+			_ = l.Shutdown(context.Background())
+		}
+	}
+
+	maybeWrap := func(s sink.Sink) (sink.Sink, error) {
 		stdoutS, ok := s.(*sink.StdoutSink)
 		if !ok || stdoutCfg.Mode == "line" {
-			return s
+			return s, nil
 		}
 		mode := sink.RunBlockModeGrouped
 		if stdoutCfg.Mode == "tree" {
@@ -207,19 +216,25 @@ func buildPipeline(dsns []string, rec *metrics.Recorder, logger *slog.Logger, st
 
 	if len(dsns) == 0 {
 		stdout := sink.NewStdoutSink(os.Stdout)
-		leaves = append(leaves, sink.NewMeteredSink(maybeWrap(stdout), rec))
+		wrapped, err := maybeWrap(stdout)
+		if err != nil {
+			return nil, nil, fmt.Errorf("wrap stdout sink: %w", err)
+		}
+		leaves = append(leaves, sink.NewMeteredSink(wrapped, rec))
 		names = append(names, stdout.Name())
 	} else {
 		for _, dsn := range dsns {
 			s, err := sink.ParseDSN(dsn)
 			if err != nil {
-				// Tear down any sinks already constructed before returning.
-				for _, l := range leaves {
-					_ = l.Shutdown(context.Background())
-				}
+				teardown()
 				return nil, nil, fmt.Errorf("parse sink %q: %w", dsn, err)
 			}
-			leaves = append(leaves, sink.NewMeteredSink(maybeWrap(s), rec))
+			wrapped, err := maybeWrap(s)
+			if err != nil {
+				teardown()
+				return nil, nil, fmt.Errorf("wrap sink %q: %w", dsn, err)
+			}
+			leaves = append(leaves, sink.NewMeteredSink(wrapped, rec))
 			names = append(names, s.Name())
 		}
 	}

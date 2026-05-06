@@ -21,6 +21,17 @@ import (
 	"github.com/rxbynerd/steeplechase/internal/format"
 )
 
+// linesWriter is the contract a sink must implement to be wrapped by
+// RunBlockSink. RunBlockSink renders each flushed buffer to a slice of
+// pre-formatted lines and forwards them through this method, which lets the
+// inner sink keep its own write serialisation (e.g. *StdoutSink's mutex)
+// intact for buffered flushes. *StdoutSink is the sole production
+// implementation; NewRunBlockSink type-asserts inner to this interface up
+// front and refuses to construct otherwise.
+type linesWriter interface {
+	writeRunBlockLines(ctx context.Context, lines []string) error
+}
+
 // RunBlockMode selects the rendering strategy used at flush time.
 type RunBlockMode int
 
@@ -79,15 +90,26 @@ type RunBlockConfig struct {
 // run.id attribute is missing follow the same bucketing as their root.
 type RunBlockSink struct {
 	inner  Sink
+	writer linesWriter // same object as inner, type-asserted at construction
 	cfg    RunBlockConfig
 	clock  Clock
 	logger *slog.Logger
 
+	// mu guards runs, traceToRun, and truncated. Lock order, when chained:
+	// RunBlockSink.mu -> StdoutSink.mu (acquired inside writeRunBlockLines).
+	// Never invert.
 	mu sync.Mutex
 	// runs holds open per-run.id buffers.
 	runs map[string]*runBuffer
 	// traceToRun maps trace_id (hex) to the run.id we last saw for that
 	// trace. Cleared on flush. Spans-only.
+	//
+	// This map cannot grow without bound: every entry's run.id is also a
+	// key in s.runs, and each run is forced to flush by one of the four
+	// flushReason paths (root-end, idle sweep, overflow, shutdown).
+	// flushLocked's defer deletes both the run from s.runs and every
+	// traceToRun entry that pointed at it, so the map's high-water mark is
+	// the live working-set of runs at any instant.
 	traceToRun map[string]string
 	// truncated tracks run.ids that overflowed; subsequent items for them
 	// bypass the buffer and stream as line mode would.
@@ -131,12 +153,18 @@ type runBuffer struct {
 	lastActivity time.Time
 }
 
-// NewRunBlockSink wraps inner with run.id-keyed buffering. Inner is expected
-// to be the underlying StdoutSink (or another writer-style sink): the
-// RunBlockSink does not call inner concurrently for a single buffer flush,
-// but inner must remain safe for concurrent use because pass-through writes
-// for unidentified items can race with flushes.
-func NewRunBlockSink(inner Sink, cfg RunBlockConfig) *RunBlockSink {
+// NewRunBlockSink wraps inner with run.id-keyed buffering. Inner must
+// implement the unexported linesWriter interface — *StdoutSink is the only
+// type that does today. Returning an error here (rather than falling back to
+// a synthetic-LogRecord path) keeps the buffered flush path simple and
+// avoids the malformed-output hazard of routing already-formatted lines
+// through ConsumeLogs.
+func NewRunBlockSink(inner Sink, cfg RunBlockConfig) (*RunBlockSink, error) {
+	writer, ok := inner.(linesWriter)
+	if !ok {
+		return nil, fmt.Errorf("runblock: inner sink %T does not implement linesWriter (expected *StdoutSink)", inner)
+	}
+
 	clock := cfg.Clock
 	if clock == nil {
 		clock = realClock{}
@@ -154,6 +182,7 @@ func NewRunBlockSink(inner Sink, cfg RunBlockConfig) *RunBlockSink {
 
 	s := &RunBlockSink{
 		inner:      inner,
+		writer:     writer,
 		cfg:        cfg,
 		clock:      clock,
 		logger:     logger,
@@ -163,7 +192,7 @@ func NewRunBlockSink(inner Sink, cfg RunBlockConfig) *RunBlockSink {
 		stopCh:     make(chan struct{}),
 	}
 	s.startSweeper()
-	return s
+	return s, nil
 }
 
 // Name returns the inner sink's label so Prometheus metrics keep the same
@@ -494,8 +523,10 @@ func (s *RunBlockSink) appendItemLocked(ctx context.Context, rb *runBuffer, item
 }
 
 // flushLocked renders rb and writes it through the inner sink. The caller
-// must hold s.mu. After flushing, the run's state (and any trace_id
-// mapping pointing at it) is removed from the sink.
+// must hold s.mu; writeRunBlockLines acquires StdoutSink.mu internally, so
+// the lock order while this runs is RunBlockSink.mu -> StdoutSink.mu and
+// must not be inverted by any future caller. After flushing, the run's
+// state (and any trace_id mapping pointing at it) is removed from the sink.
 func (s *RunBlockSink) flushLocked(ctx context.Context, rb *runBuffer, reason flushReason) {
 	defer func() {
 		delete(s.runs, rb.runID)
@@ -555,48 +586,11 @@ func (s *RunBlockSink) flushLocked(ctx context.Context, rb *runBuffer, reason fl
 		)
 	}
 
-	// Convert to a stream of log records and emit through the inner sink so
-	// the existing mutex serialisation and metering wraps still apply. We
-	// use the LOG channel because every non-line block is, semantically,
-	// already-formatted text — but to avoid muddying line-mode log
-	// formatting, we just write directly to the inner StdoutSink-like
-	// interface. The inner sink writes formatted lines for any signal
-	// through the same writer, so we synthesise a single LogRecord per
-	// line carrying the line as Body.
-	//
-	// In practice the inner sink is *StdoutSink (set up by main.go), so we
-	// reach for a writer-level interface to keep line shapes intact. We
-	// fall back to wrapping each line as a fake LOG record only if inner
-	// does not satisfy the writer interface.
-	if w, ok := s.inner.(linesWriter); ok {
-		_ = w.writeRunBlockLines(ctx, lines)
-		return
-	}
-
-	// Fallback: send lines as synthetic log records carrying the rendered
-	// text in the body. This loses the line shape (a synthetic [LOG] prefix
-	// will be added) but keeps the data flowing if the inner sink is not a
-	// StdoutSink.
-	for _, line := range lines {
-		req := &collogspb.ExportLogsServiceRequest{
-			ResourceLogs: []*logspb.ResourceLogs{{
-				ScopeLogs: []*logspb.ScopeLogs{{
-					LogRecords: []*logspb.LogRecord{{
-						Body: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: line}},
-					}},
-				}},
-			}},
-		}
-		_ = s.inner.ConsumeLogs(ctx, req)
-	}
-}
-
-// linesWriter is the optional interface used by RunBlockSink to forward
-// pre-rendered lines to the inner sink without re-formatting. StdoutSink
-// implements this so the rendered run block goes through its existing
-// mutex-serialised writeLines path.
-type linesWriter interface {
-	writeRunBlockLines(ctx context.Context, lines []string) error
+	// Forward the rendered lines through the writer the constructor
+	// validated. StdoutSink's writeRunBlockLines acquires its own mutex
+	// before writing, so the buffered flush still serialises against any
+	// concurrent line-mode writes to the same writer.
+	_ = s.writer.writeRunBlockLines(ctx, lines)
 }
 
 // streamSingleSpan, streamSingleLog, streamSingleMetric pass exactly one
@@ -1049,14 +1043,3 @@ func isRunRootEnd(span *tracepb.Span) bool {
 
 // Compile-time assertion that we satisfy the Sink interface.
 var _ Sink = (*RunBlockSink)(nil)
-
-// stdoutSinkLinesWriter wires *StdoutSink into the linesWriter interface
-// without modifying StdoutSink itself. We expose this here (rather than as
-// a method on StdoutSink) so the writer-level extension stays scoped to
-// the run-block path; line-mode users see no surface change.
-func (s *StdoutSink) writeRunBlockLines(_ context.Context, lines []string) error {
-	if err := s.writeLines(lines); err != nil {
-		return fmt.Errorf("runblock write: %w", err)
-	}
-	return nil
-}
