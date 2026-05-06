@@ -28,7 +28,10 @@ func SeverityName(sev logspb.SeverityNumber) string {
 }
 
 // FormatLogs formats an OTLP log export into human-readable lines.
-// Claude Code events have an event name attribute; regular logs use severity + body.
+// Records carrying an event.name attribute are rendered as events
+// (e.g. claude_code.api_request); records without one fall back to
+// severity + body, which is the shape stirrup-harness slog handlers
+// emit when wired through the OTLP log bridge.
 func FormatLogs(resourceLogs []*logspb.ResourceLogs) []string {
 	var lines []string
 	for _, rl := range resourceLogs {

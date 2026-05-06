@@ -363,6 +363,155 @@ func TestFormatAnyValue_BytesAndKvlist(t *testing.T) {
 	}
 }
 
+// Stirrup is the primary telemetry source for Steeplechase. The fixtures
+// below mirror the OTLP shapes that stirrup-harness actually emits
+// (counters under stirrup.harness.*, run-tagged spans, observable gauges
+// for live context-token estimates) so changes to the formatter that
+// only happen to keep the Claude Code fixtures green can't silently
+// regress Stirrup output.
+
+func TestFormatMetrics_Stirrup_TokensInputCounter(t *testing.T) {
+	rm := []*metricspb.ResourceMetrics{{
+		Resource: &resourcepb.Resource{
+			Attributes: []*commonpb.KeyValue{
+				{Key: "service.name", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "stirrup-harness"}}},
+			},
+		},
+		ScopeMetrics: []*metricspb.ScopeMetrics{{
+			Metrics: []*metricspb.Metric{{
+				Name: "stirrup.harness.tokens.input",
+				Data: &metricspb.Metric_Sum{Sum: &metricspb.Sum{
+					DataPoints: []*metricspb.NumberDataPoint{{
+						TimeUnixNano: 1710504600123000000,
+						Value:        &metricspb.NumberDataPoint_AsInt{AsInt: 4096},
+						Attributes: []*commonpb.KeyValue{
+							{Key: "run.id", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "run-abc"}}},
+							{Key: "run.mode", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "execution"}}},
+						},
+					}},
+				}},
+			}},
+		}},
+	}}
+
+	lines := FormatMetrics(rm)
+	if len(lines) != 1 {
+		t.Fatalf("expected 1 line, got %d", len(lines))
+	}
+	line := lines[0]
+	if !strings.Contains(line, "stirrup.harness.tokens.input") {
+		t.Errorf("missing metric name: %s", line)
+	}
+	if !strings.Contains(line, "= 4096") {
+		t.Errorf("missing value: %s", line)
+	}
+	if !strings.Contains(line, "run.id=run-abc") {
+		t.Errorf("missing run.id attribute: %s", line)
+	}
+	if !strings.Contains(line, "run.mode=execution") {
+		t.Errorf("missing run.mode attribute: %s", line)
+	}
+	if !strings.Contains(line, "service.name=stirrup-harness") {
+		t.Errorf("expected resource attribute to be merged in: %s", line)
+	}
+}
+
+func TestFormatMetrics_Stirrup_ContextTokensGauge(t *testing.T) {
+	rm := []*metricspb.ResourceMetrics{{
+		ScopeMetrics: []*metricspb.ScopeMetrics{{
+			Metrics: []*metricspb.Metric{{
+				Name: "stirrup.harness.context_tokens",
+				Data: &metricspb.Metric_Gauge{Gauge: &metricspb.Gauge{
+					DataPoints: []*metricspb.NumberDataPoint{{
+						TimeUnixNano: 1710504600123000000,
+						Value:        &metricspb.NumberDataPoint_AsInt{AsInt: 87234},
+						Attributes: []*commonpb.KeyValue{
+							{Key: "run.id", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "run-abc"}}},
+							{Key: "run.mode", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "execution"}}},
+						},
+					}},
+				}},
+			}},
+		}},
+	}}
+
+	lines := FormatMetrics(rm)
+	if len(lines) != 1 {
+		t.Fatalf("expected 1 line, got %d", len(lines))
+	}
+	if !strings.Contains(lines[0], "stirrup.harness.context_tokens") {
+		t.Errorf("missing gauge name: %s", lines[0])
+	}
+	if !strings.Contains(lines[0], "= 87234") {
+		t.Errorf("missing gauge value: %s", lines[0])
+	}
+}
+
+func TestFormatTraces_Stirrup_TurnSpan(t *testing.T) {
+	rs := []*tracepb.ResourceSpans{{
+		ScopeSpans: []*tracepb.ScopeSpans{{
+			Spans: []*tracepb.Span{{
+				Name:              "turn[3]",
+				TraceId:           []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+				SpanId:            []byte{1, 2, 3, 4, 5, 6, 7, 8},
+				StartTimeUnixNano: 1710504600123000000,
+				Attributes: []*commonpb.KeyValue{
+					{Key: "turn.number", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_IntValue{IntValue: 3}}},
+					{Key: "turn.tokens.input", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_IntValue{IntValue: 1024}}},
+					{Key: "turn.tokens.output", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_IntValue{IntValue: 256}}},
+					{Key: "turn.tool_calls", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_IntValue{IntValue: 2}}},
+					{Key: "turn.stop_reason", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "tool_use"}}},
+				},
+			}},
+		}},
+	}}
+
+	lines := FormatTraces(rs)
+	if len(lines) != 1 {
+		t.Fatalf("expected 1 line, got %d", len(lines))
+	}
+	line := lines[0]
+	if !strings.Contains(line, "[TRACE]") {
+		t.Errorf("missing [TRACE] prefix: %s", line)
+	}
+	if !strings.Contains(line, "turn[3]") {
+		t.Errorf("missing span name: %s", line)
+	}
+	if !strings.Contains(line, "turn.stop_reason=tool_use") {
+		t.Errorf("missing turn.stop_reason: %s", line)
+	}
+}
+
+func TestFormatTraces_Stirrup_ToolCallSpan(t *testing.T) {
+	rs := []*tracepb.ResourceSpans{{
+		ScopeSpans: []*tracepb.ScopeSpans{{
+			Spans: []*tracepb.Span{{
+				Name:              "tool_call",
+				TraceId:           []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+				SpanId:            []byte{9, 10, 11, 12, 13, 14, 15, 16},
+				StartTimeUnixNano: 1710504600123000000,
+				Attributes: []*commonpb.KeyValue{
+					{Key: "tool.name", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "edit_file"}}},
+					{Key: "tool.success", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_BoolValue{BoolValue: true}}},
+					{Key: "tool.duration_ms", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_IntValue{IntValue: 142}}},
+				},
+			}},
+		}},
+	}}
+
+	lines := FormatTraces(rs)
+	if len(lines) != 1 {
+		t.Fatalf("expected 1 line, got %d", len(lines))
+	}
+	line := lines[0]
+	if !strings.Contains(line, "tool.name=edit_file") {
+		t.Errorf("missing tool.name: %s", line)
+	}
+	if !strings.Contains(line, "tool.success=true") {
+		t.Errorf("missing tool.success: %s", line)
+	}
+}
+
 func TestFormatLogs_EventWithBody(t *testing.T) {
 	rl := []*logspb.ResourceLogs{{
 		ScopeLogs: []*logspb.ScopeLogs{{
