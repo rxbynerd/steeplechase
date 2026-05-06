@@ -18,6 +18,7 @@ go mod tidy       # After dependency changes
 - `cmd/steeplechase/main.go` - CLI entrypoint, flag parsing, pipeline construction, signal-driven shutdown
 - `internal/sink/sink.go` - Sink interface (`ConsumeMetrics`, `ConsumeLogs`, `ConsumeTraces`, `Name`, `Shutdown`)
 - `internal/sink/stdout.go` - StdoutSink: mutex-serialized writes to io.Writer
+- `internal/sink/runblock.go` - RunBlockSink: wraps StdoutSink, buffers per-run.id and renders grouped/tree blocks via `internal/format/runblock.go`
 - `internal/sink/fanout.go` - FanoutSink: parallel best-effort fan-out with slog per-child failure logging
 - `internal/sink/metered.go` - MeteredSink: wraps any Sink and observes Prometheus metrics
 - `internal/sink/otlp_forward.go` - OTLPForwardSink + transport interface
@@ -32,6 +33,7 @@ go mod tidy       # After dependency changes
 - `internal/metrics/` - Prometheus `Recorder` (sink + receiver counters, histograms, gauges)
 - `internal/admin/` - Admin HTTP server: `/healthz`, `/readyz`, `/metrics`
 - `internal/format/` - Human-readable formatting for metrics, logs, traces (used by StdoutSink)
+- `internal/format/runblock.go` - Per-run block renderer (header/footer banners, grouped vs tree body, tree depth from `parent_span_id`)
 
 ## Conventions
 
@@ -44,3 +46,4 @@ go mod tidy       # After dependency changes
 - Prometheus registry and `metrics.Recorder` are constructed in `main` and passed into receivers and `MeteredSink` wrappers; avoid global registries
 - Version baked in via `-ldflags "-X main.version=..."` and surfaced as `steeplechase_build_info{version}`
 - Tests use `*_test.go` convention alongside source files; routing-sink tests use `package sink_test` to avoid an import cycle with `internal/sinktest`
+- `--stdout-format=grouped|tree` keys per-run buffers off `run.id` (set by Stirrup on the root span and on metric data-point attributes); the RunBlockSink also keeps a `trace_id -> run.id` map so child spans whose own `run.id` attribute is missing can still be bucketed correctly. Items with no discoverable `run.id` bypass the buffer entirely — keep this contract intact when extending the sink

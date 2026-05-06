@@ -54,12 +54,20 @@ export OTEL_METRIC_EXPORT_INTERVAL=10000
 ## Flags
 
 ```
---grpc-addr   gRPC listen address (default :4317)
---http-addr   HTTP listen address (default :4318)
---admin-addr  Admin listener for /healthz, /readyz, /metrics (default :9090)
---sink        Sink DSN, repeatable. Defaults to stdout if none given.
---version     Print version and exit
+--grpc-addr             gRPC listen address (default :4317)
+--http-addr             HTTP listen address (default :4318)
+--admin-addr            Admin listener for /healthz, /readyz, /metrics (default :9090)
+--sink                  Sink DSN, repeatable. Defaults to stdout if none given.
+--stdout-format         Stdout layout: line (default), grouped, or tree.
+--stdout-run-timeout    Per-run idle timeout for grouped/tree modes (default 5m).
+--stdout-run-max-items  Per-run buffered-item cap for grouped/tree modes (default 10000).
+--version               Print version and exit
 ```
+
+The `--stdout-format` / `--stdout-run-timeout` / `--stdout-run-max-items` flags
+configure how stdout groups telemetry that carries `run.id`. They affect
+stdout sinks only; OTLP forwarding sinks always receive the original
+payload unchanged. See [Output Format](#output-format) below for examples.
 
 ## Routing
 
@@ -118,11 +126,51 @@ A dedicated listener (default `:9090`) exposes:
 
 ## Output Format
 
+The default layout (`--stdout-format=line`) prints one line per OTLP item
+as it arrives:
+
 ```
 [METRIC] 2026-03-15T10:30:00.123Z stirrup.harness.tokens.input = 1523 {run.id=abc, run.mode=execution}
 [EVENT]  2026-03-15T10:30:01.456Z claude_code.api_request {model=claude-sonnet-4-6, duration_ms=2341}
 [LOG]    2026-03-15T10:30:03.012Z INFO "message body" {attr1=val1}
 [TRACE]  2026-03-15T10:30:04.000Z turn[3] trace=abc123 span=def456
+```
+
+### Per-run grouping
+
+`--stdout-format=grouped` buffers every item that carries a `run.id` (Stirrup
+sets this on its `run` root span and on every metric data point) and flushes
+the run as a single block when the root span ends with a `run.outcome`
+attribute, when the run has been idle for `--stdout-run-timeout`, or when
+`--stdout-run-max-items` is exceeded. Items with no discoverable `run.id`
+stream straight through unchanged.
+
+```
+=== run abc started 2026-03-15T10:30:00.000Z mode=execution provider=anthropic model=claude-sonnet-4-6 ===
+[TRACE]  2026-03-15T10:30:00.000Z run trace=abc123 span=root1 {run.id=abc, run.mode=execution}
+[METRIC] 2026-03-15T10:30:00.123Z stirrup.harness.tokens.input = 1523 {run.id=abc, run.mode=execution}
+[TRACE]  2026-03-15T10:30:01.500Z turn[1] trace=abc123 span=turn1 {turn.number=1}
+[TRACE]  2026-03-15T10:30:02.000Z tool_call trace=abc123 span=tool1 {tool.name=edit_file}
+=== run abc finished 2026-03-15T10:30:03.000Z outcome=success turns=1 ===
+```
+
+If the run is flushed by idle timeout or shutdown the footer reads
+`outcome=<unknown>`. Buffer overflow replaces the footer with a single
+`[WARN] run abc truncated at <N> items` line, after which any further items
+for that `run.id` stream as line mode would.
+
+### Tree view of spans
+
+`--stdout-format=tree` uses the same per-run buffering as `grouped`, but
+spans are indented by depth from their `parent_span_id` chain. Logs and
+metrics remain flat and chronologically interleaved with the trace lines.
+
+```
+=== run abc started 2026-03-15T10:30:00.000Z ===
+[TRACE]  2026-03-15T10:30:00.000Z run trace=abc123 span=root1
+[TRACE]    2026-03-15T10:30:01.500Z turn[1] trace=abc123 span=turn1
+[TRACE]      2026-03-15T10:30:02.000Z tool_call trace=abc123 span=tool1
+=== run abc finished 2026-03-15T10:30:03.000Z outcome=success ===
 ```
 
 ## Supported telemetry sources
