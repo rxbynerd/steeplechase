@@ -115,8 +115,9 @@ type RunBlockSink struct {
 	// bypass the buffer and stream as line mode would.
 	truncated map[string]bool
 
-	stopCh chan struct{}
-	wg     sync.WaitGroup
+	stopCh   chan struct{}
+	stopOnce sync.Once
+	wg       sync.WaitGroup
 }
 
 // pendingItem couples an item with the run.id it should be appended to.
@@ -202,22 +203,28 @@ func (s *RunBlockSink) Name() string { return s.inner.Name() }
 // Shutdown flushes every open buffer with outcome=<unknown> (treating
 // shutdown as an idle-timeout flush) and then shuts the inner sink down.
 // The sweeper goroutine is stopped before the final flush so it does not
-// race with the shutdown path.
+// race with the shutdown path. Shutdown is safe to call more than once;
+// subsequent calls skip the (already-completed) sweeper teardown but still
+// propagate the inner sink's Shutdown error so the call remains usable as
+// the canonical sink-shutdown invocation in tests and in the main.go
+// double-shutdown defer.
 func (s *RunBlockSink) Shutdown(ctx context.Context) error {
-	close(s.stopCh)
-	s.wg.Wait()
+	s.stopOnce.Do(func() {
+		close(s.stopCh)
+		s.wg.Wait()
 
-	s.mu.Lock()
-	open := make([]*runBuffer, 0, len(s.runs))
-	for _, rb := range s.runs {
-		open = append(open, rb)
-	}
-	// Determinism is nice for shutdown logs and tests.
-	sort.Slice(open, func(i, j int) bool { return open[i].runID < open[j].runID })
-	for _, rb := range open {
-		s.flushLocked(ctx, rb, flushReasonShutdown)
-	}
-	s.mu.Unlock()
+		s.mu.Lock()
+		open := make([]*runBuffer, 0, len(s.runs))
+		for _, rb := range s.runs {
+			open = append(open, rb)
+		}
+		// Determinism is nice for shutdown logs and tests.
+		sort.Slice(open, func(i, j int) bool { return open[i].runID < open[j].runID })
+		for _, rb := range open {
+			s.flushLocked(ctx, rb, flushReasonShutdown)
+		}
+		s.mu.Unlock()
+	})
 
 	return s.inner.Shutdown(ctx)
 }

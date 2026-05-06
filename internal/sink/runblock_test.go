@@ -380,6 +380,34 @@ func TestRunBlock_ShutdownFlushesOpenRuns(t *testing.T) {
 	}
 }
 
+// TestRunBlock_ShutdownIsIdempotent guards against the previous bug where a
+// second Shutdown closed an already-closed stopCh and panicked. main.go's
+// shutdown path defers a best-effort Shutdown and then calls Shutdown again
+// on the orderly-shutdown branch, so a panic on the second call would crash
+// the binary on every clean exit.
+func TestRunBlock_ShutdownIsIdempotent(t *testing.T) {
+	var buf bytes.Buffer
+	stdout := sink.NewStdoutSink(&buf)
+	clock := newFakeClock(time.Unix(0, 1710504600000000000))
+	rb := mustNewRunBlockSink(t, stdout, sink.RunBlockConfig{
+		Mode:        sink.RunBlockModeGrouped,
+		IdleTimeout: time.Hour,
+		MaxItems:    100,
+		Clock:       clock,
+		Logger:      quietRunblockLogger(),
+	})
+
+	if err := rb.Shutdown(context.Background()); err != nil {
+		t.Fatalf("first shutdown: %v", err)
+	}
+	// A second Shutdown must not close stopCh again (panic), and must still
+	// return a usable error (here nil, since the inner StdoutSink's
+	// Shutdown is a no-op).
+	if err := rb.Shutdown(context.Background()); err != nil {
+		t.Fatalf("second shutdown: %v", err)
+	}
+}
+
 func TestRunBlock_TraceIDMappingForChildSpans(t *testing.T) {
 	var buf bytes.Buffer
 	stdout := sink.NewStdoutSink(&buf)
