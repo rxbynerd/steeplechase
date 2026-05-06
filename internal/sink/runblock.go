@@ -200,6 +200,13 @@ func NewRunBlockSink(inner Sink, cfg RunBlockConfig) (*RunBlockSink, error) {
 // per-sink identity ("stdout") regardless of the buffering wrapper.
 func (s *RunBlockSink) Name() string { return s.inner.Name() }
 
+// Mode returns the render mode this sink was configured with. It is
+// intended for topology tests in main.go that need to assert the wiring
+// chose grouped vs tree correctly; without an accessor a mode-mismatch
+// bug (e.g. tree wired to RunBlockModeGrouped) would silently pass any
+// "is this a *RunBlockSink?" check.
+func (s *RunBlockSink) Mode() RunBlockMode { return s.cfg.Mode }
+
 // Shutdown flushes every open buffer with outcome=<unknown> (treating
 // shutdown as an idle-timeout flush) and then shuts the inner sink down.
 // The sweeper goroutine is stopped before the final flush so it does not

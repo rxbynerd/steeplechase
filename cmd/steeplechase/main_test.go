@@ -104,8 +104,14 @@ func TestBuildPipeline_GroupedModeWrapsStdout(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected *MeteredSink, got %T", root)
 	}
-	if _, isRB := metered.Inner().(*sink.RunBlockSink); !isRB {
+	rb, isRB := metered.Inner().(*sink.RunBlockSink)
+	if !isRB {
 		t.Fatalf("grouped mode must wrap stdout in RunBlockSink, got %T", metered.Inner())
+	}
+	// Discriminate against a mis-wired tree assignment: the wrapper has to
+	// be told to render in the configured mode, not just constructed.
+	if got := rb.Mode(); got != sink.RunBlockModeGrouped {
+		t.Errorf("grouped mode produced sink with render mode %v, want %v", got, sink.RunBlockModeGrouped)
 	}
 }
 
@@ -128,8 +134,12 @@ func TestBuildPipeline_TreeModeWrapsStdout(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected *MeteredSink, got %T", root)
 	}
-	if _, isRB := metered.Inner().(*sink.RunBlockSink); !isRB {
+	rb, isRB := metered.Inner().(*sink.RunBlockSink)
+	if !isRB {
 		t.Fatalf("tree mode must wrap stdout in RunBlockSink, got %T", metered.Inner())
+	}
+	if got := rb.Mode(); got != sink.RunBlockModeTree {
+		t.Errorf("tree mode produced sink with render mode %v, want %v", got, sink.RunBlockModeTree)
 	}
 }
 
