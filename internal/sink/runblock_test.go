@@ -321,15 +321,29 @@ func TestRunBlock_OverflowTruncatesAndStreams(t *testing.T) {
 	}
 
 	out := buf.String()
-	if !strings.Contains(out, "[WARN] run abc truncated at 3 items") {
-		t.Errorf("expected truncation warn line, got %q", out)
+	// MaxItems=2 caps the buffer at exactly two items, so the truncation
+	// warning reports 2. The third span is the one that triggered the
+	// overflow flush and is rejected from the buffer; it streams as a
+	// line-mode bypass alongside the fourth.
+	if !strings.Contains(out, "[WARN] run abc truncated at 2 items") {
+		t.Errorf("expected truncation warn line for 2 items, got %q", out)
 	}
-	// The first three should be in a run block, the fourth should appear as
-	// a line-mode pass-through after the warn.
+	// The first two should be in a run block, the third and fourth should
+	// each appear as line-mode pass-throughs after the warn.
 	warnIdx := strings.Index(out, "[WARN]")
 	lastIdx := strings.LastIndex(out, "[TRACE]")
 	if warnIdx < 0 || lastIdx < 0 || lastIdx < warnIdx {
 		t.Errorf("expected post-overflow trace line after warn, got %q", out)
+	}
+	// Pre-warn output should contain exactly 2 [TRACE] lines (the buffered
+	// pair) and post-warn should contain 2 more (the bypass-routed pair).
+	preWarn := out[:warnIdx]
+	postWarn := out[warnIdx:]
+	if got := strings.Count(preWarn, "[TRACE]"); got != 2 {
+		t.Errorf("expected 2 [TRACE] lines before warn, got %d in %q", got, preWarn)
+	}
+	if got := strings.Count(postWarn, "[TRACE]"); got != 2 {
+		t.Errorf("expected 2 [TRACE] lines after warn (bypass-routed), got %d in %q", got, postWarn)
 	}
 }
 

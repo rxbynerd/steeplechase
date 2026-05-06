@@ -318,7 +318,15 @@ func (s *RunBlockSink) ConsumeMetrics(ctx context.Context, req *colmetricspb.Exp
 			continue
 		}
 		rb := s.openRunLocked(p.runID, now)
-		s.appendItemLocked(ctx, rb, p.item, now)
+		if !s.appendItemLocked(ctx, rb, p.item, now) {
+			// appendItemLocked flushed-on-overflow and rejected this item.
+			// Route it through the bypass path; the truncated marker is
+			// already set so subsequent items for this run.id will follow
+			// the same path on the next loop iteration.
+			s.mu.Unlock()
+			s.streamSingleMetric(ctx, p.item)
+			s.mu.Lock()
+		}
 	}
 	s.mu.Unlock()
 	return nil
@@ -392,7 +400,11 @@ func (s *RunBlockSink) ConsumeLogs(ctx context.Context, req *collogspb.ExportLog
 			continue
 		}
 		rb := s.openRunLocked(p.runID, now)
-		s.appendItemLocked(ctx, rb, p.item, now)
+		if !s.appendItemLocked(ctx, rb, p.item, now) {
+			s.mu.Unlock()
+			s.streamSingleLog(ctx, p.item.Log)
+			s.mu.Lock()
+		}
 	}
 	s.mu.Unlock()
 	return nil
@@ -489,7 +501,17 @@ func (s *RunBlockSink) ConsumeTraces(ctx context.Context, req *coltracepb.Export
 			Kind:      format.RunBlockItemSpan,
 			Span:      p.span,
 		}
-		s.appendItemLocked(ctx, rb, item, now)
+		appended := s.appendItemLocked(ctx, rb, item, now)
+		if !appended {
+			// Overflow rejected this span. The run is now truncated; the
+			// truncation warning has already replaced the footer, so we do
+			// not emit a root-end flush even if this span is the run root
+			// signal. Forward the span via the line-mode bypass.
+			s.mu.Unlock()
+			s.streamSingleSpan(ctx, p.span)
+			s.mu.Lock()
+			continue
+		}
 		if p.rootEnd {
 			rb.rootEnded = true
 			s.flushLocked(ctx, rb, flushReasonRootEnded)
@@ -512,14 +534,24 @@ func (s *RunBlockSink) openRunLocked(runID string, now time.Time) *runBuffer {
 	return rb
 }
 
-// appendItemLocked adds item to rb and triggers an overflow flush when the
-// configured cap is exceeded. The caller must hold s.mu.
-func (s *RunBlockSink) appendItemLocked(ctx context.Context, rb *runBuffer, item format.RunBlockItem, now time.Time) {
+// appendItemLocked adds item to rb unless doing so would exceed the
+// configured cap. On overflow it flushes the existing buffer (which holds
+// exactly MaxItems items) with a truncation warning and returns false; the
+// caller is then responsible for routing the rejected item — and any
+// subsequent items for the same run.id — through the line-mode bypass. The
+// caller must hold s.mu. Returning a bool rather than swallowing the
+// rejection keeps the call sites responsible for the bypass write, which
+// avoids re-acquiring s.mu inside this helper.
+func (s *RunBlockSink) appendItemLocked(ctx context.Context, rb *runBuffer, item format.RunBlockItem, now time.Time) bool {
+	if s.cfg.MaxItems > 0 && len(rb.items) >= s.cfg.MaxItems {
+		// Flush the buffer at exactly MaxItems items; the rejected item is
+		// not appended so the truncation warning's count is accurate.
+		s.flushLocked(ctx, rb, flushReasonOverflow)
+		return false
+	}
 	rb.items = append(rb.items, item)
 	rb.lastActivity = now
-	if s.cfg.MaxItems > 0 && len(rb.items) > s.cfg.MaxItems {
-		s.flushLocked(ctx, rb, flushReasonOverflow)
-	}
+	return true
 }
 
 // flushLocked renders rb and writes it through the inner sink. The caller
