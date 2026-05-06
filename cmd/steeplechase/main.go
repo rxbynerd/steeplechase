@@ -38,6 +38,12 @@ func main() {
 	httpAddr := flag.String("http-addr", ":4318", "HTTP listen address")
 	adminAddr := flag.String("admin-addr", ":9090", "Admin HTTP listen address (/healthz, /readyz, /metrics)")
 	flag.Var(&sinks, "sink", "Sink DSN (repeatable). Examples: stdout, otlp+grpc://host:4317, otlp+http://host:4318?header=x-api-key:... . If omitted, defaults to stdout.")
+	// stdout-format/run-timeout/run-max-items belong together: they
+	// configure how a run.id-aware stdout sink groups telemetry into
+	// per-run blocks. Defaults preserve today's line-by-line behaviour.
+	stdoutFormat := flag.String("stdout-format", "line", "Stdout layout: line (default, today's behaviour), grouped (per-run.id buffer flushed on root-end), or tree (grouped, with spans rendered as a parent->child tree).")
+	stdoutRunTimeout := flag.Duration("stdout-run-timeout", 5*time.Minute, "Per-run idle timeout for grouped/tree modes; ignored in line mode. A run with no items received for this long is force-flushed with outcome=<unknown>.")
+	stdoutRunMaxItems := flag.Int("stdout-run-max-items", 10000, "Per-run buffered-item cap for grouped/tree modes; ignored in line mode. On overflow the run is force-flushed with a truncation warning and any subsequent items for that run.id stream as line mode would.")
 	flag.Parse()
 
 	if *showVersion {
@@ -48,11 +54,16 @@ func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
 
+	stdoutCfg, err := parseStdoutFormat(*stdoutFormat, *stdoutRunTimeout, *stdoutRunMaxItems)
+	if err != nil {
+		log.Fatalf("stdout-format: %v", err)
+	}
+
 	reg := prometheus.NewRegistry()
 	rec := metrics.NewRecorder(reg)
 	rec.SetBuildInfo(version)
 
-	root, leafNames, err := buildPipeline(sinks, rec, logger)
+	root, leafNames, err := buildPipeline(sinks, rec, logger, stdoutCfg)
 	if err != nil {
 		log.Fatalf("sink configuration error: %v", err)
 	}
@@ -131,6 +142,36 @@ func main() {
 	logger.Info("shutdown complete")
 }
 
+// stdoutOptions captures the parsed --stdout-format / --stdout-run-timeout /
+// --stdout-run-max-items group. Wrapping is applied only when a stdout
+// sink is in the pipeline and Mode != line; otherwise stdout is wired
+// straight through, identical to today's build.
+type stdoutOptions struct {
+	Mode        string // "line", "grouped", or "tree"
+	IdleTimeout time.Duration
+	MaxItems    int
+}
+
+// parseStdoutFormat validates the flag triple. An invalid mode is a hard
+// startup failure rather than silent fallback so typos don't yield a
+// surprising layout in production.
+func parseStdoutFormat(mode string, timeout time.Duration, maxItems int) (stdoutOptions, error) {
+	switch mode {
+	case "line", "grouped", "tree":
+	default:
+		return stdoutOptions{}, fmt.Errorf("invalid mode %q (want line, grouped, or tree)", mode)
+	}
+	if mode != "line" {
+		if timeout <= 0 {
+			return stdoutOptions{}, fmt.Errorf("--stdout-run-timeout must be > 0 when --stdout-format=%s", mode)
+		}
+		if maxItems <= 0 {
+			return stdoutOptions{}, fmt.Errorf("--stdout-run-max-items must be > 0 when --stdout-format=%s", mode)
+		}
+	}
+	return stdoutOptions{Mode: mode, IdleTimeout: timeout, MaxItems: maxItems}, nil
+}
+
 // buildPipeline parses the provided sink DSNs, wraps each leaf in a
 // MeteredSink so metrics are observed per destination, and composes the
 // result under a FanoutSink when more than one sink is configured. It
@@ -138,13 +179,35 @@ func main() {
 //
 // When dsns is empty, the function falls back to a single StdoutSink so that
 // `steeplechase` with no flags continues to behave like today's build.
-func buildPipeline(dsns []string, rec *metrics.Recorder, logger *slog.Logger) (sink.Sink, []string, error) {
+//
+// stdoutCfg controls whether stdout sinks (whether the implicit default or
+// explicit --sink stdout) are wrapped with run.id-aware buffering. The
+// wrapper sits inside the MeteredSink so that buffered flushes still
+// observe the existing per-sink Prometheus counters.
+func buildPipeline(dsns []string, rec *metrics.Recorder, logger *slog.Logger, stdoutCfg stdoutOptions) (sink.Sink, []string, error) {
 	var leaves []sink.Sink
 	var names []string
 
+	maybeWrap := func(s sink.Sink) sink.Sink {
+		stdoutS, ok := s.(*sink.StdoutSink)
+		if !ok || stdoutCfg.Mode == "line" {
+			return s
+		}
+		mode := sink.RunBlockModeGrouped
+		if stdoutCfg.Mode == "tree" {
+			mode = sink.RunBlockModeTree
+		}
+		return sink.NewRunBlockSink(stdoutS, sink.RunBlockConfig{
+			Mode:        mode,
+			IdleTimeout: stdoutCfg.IdleTimeout,
+			MaxItems:    stdoutCfg.MaxItems,
+			Logger:      logger,
+		})
+	}
+
 	if len(dsns) == 0 {
 		stdout := sink.NewStdoutSink(os.Stdout)
-		leaves = append(leaves, sink.NewMeteredSink(stdout, rec))
+		leaves = append(leaves, sink.NewMeteredSink(maybeWrap(stdout), rec))
 		names = append(names, stdout.Name())
 	} else {
 		for _, dsn := range dsns {
@@ -156,7 +219,7 @@ func buildPipeline(dsns []string, rec *metrics.Recorder, logger *slog.Logger) (s
 				}
 				return nil, nil, fmt.Errorf("parse sink %q: %w", dsn, err)
 			}
-			leaves = append(leaves, sink.NewMeteredSink(s, rec))
+			leaves = append(leaves, sink.NewMeteredSink(maybeWrap(s), rec))
 			names = append(names, s.Name())
 		}
 	}
