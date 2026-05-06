@@ -1,6 +1,8 @@
 # Steeplechase
 
-Lightweight OTLP router for Claude Code telemetry. Single Go binary, no OTel Collector SDK. Receives OTLP on :4317/:4318 and fans each payload out to one or more configured sinks (stdout, OTLP gRPC, OTLP HTTP).
+Lightweight OTLP router for AI coding harness telemetry. Single Go binary, no OTel Collector SDK. Receives OTLP on :4317/:4318 and fans each payload out to one or more configured sinks (stdout, OTLP gRPC, OTLP HTTP).
+
+Built primarily to support Stirrup (`github.com/rxbynerd/stirrup`) development. Claude Code is a secondary supported source; the routing path is signal-agnostic so any OTLP client works without code changes.
 
 ## Build & Test
 

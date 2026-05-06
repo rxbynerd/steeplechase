@@ -1,6 +1,8 @@
 # Steeplechase
 
-A lightweight OTLP router for Claude Code telemetry. Receives OpenTelemetry metrics, logs, and traces on the standard OTLP ports and fans them out to one or more destinations: stdout, another OTLP backend, or any combination.
+A lightweight OTLP router for AI coding harness telemetry. Receives OpenTelemetry metrics, logs, and traces on the standard OTLP ports and fans them out to one or more destinations: stdout, another OTLP backend, or any combination.
+
+Built primarily to support [Stirrup](https://github.com/rxbynerd/stirrup) development. Claude Code is a secondary supported source — both are standard OTLP clients, and any other OTel-instrumented harness will work without changes.
 
 Single Go binary, no OTel Collector SDK.
 
@@ -19,7 +21,18 @@ Forward to another OTLP backend while also printing locally:
   --sink 'otlp+grpc://vector.internal:4317?compression=gzip&header=x-api-key:secret'
 ```
 
-Configure Claude Code to send telemetry:
+### Pointing Stirrup at Steeplechase
+
+```bash
+./stirrup harness \
+  --prompt "Fix the failing test in main_test.go" \
+  --trace-emitter otel \
+  --otel-endpoint localhost:4317
+```
+
+Stirrup also emits its harness metrics over OTLP/gRPC to the same endpoint when one is configured. See [`docs/safety-rings.md`](https://github.com/rxbynerd/stirrup/blob/main/docs/safety-rings.md) in the Stirrup repo for production-shape configurations.
+
+### Pointing Claude Code at Steeplechase
 
 ```bash
 export CLAUDE_CODE_ENABLE_TELEMETRY=1
@@ -106,17 +119,35 @@ A dedicated listener (default `:9090`) exposes:
 ## Output Format
 
 ```
-[METRIC] 2026-03-15T10:30:00.123Z claude_code.token.usage = 1523 {type=input, model=claude-sonnet-4-6}
+[METRIC] 2026-03-15T10:30:00.123Z stirrup.harness.tokens.input = 1523 {run.id=abc, run.mode=execution}
 [EVENT]  2026-03-15T10:30:01.456Z claude_code.api_request {model=claude-sonnet-4-6, duration_ms=2341}
 [LOG]    2026-03-15T10:30:03.012Z INFO "message body" {attr1=val1}
-[TRACE]  2026-03-15T10:30:04.000Z span-name trace=abc123 span=def456
+[TRACE]  2026-03-15T10:30:04.000Z turn[3] trace=abc123 span=def456
 ```
 
-## What Claude Code Emits
+## Supported telemetry sources
+
+Steeplechase routes by OTLP envelope and does not interpret signal-specific semantics, so any OTel-instrumented client targeting `:4317` (gRPC) or `:4318` (HTTP) will be accepted. The two harnesses below are the ones used in active development; representative shapes from each are exercised by the test suite.
+
+### Stirrup (primary)
+
+Stirrup emits OTel traces and metrics over OTLP/gRPC when started with `--trace-emitter otel`.
+
+**Metrics** (`stirrup.harness.*` prefix):
+
+- Counters: `runs`, `turns`, `tokens.input`, `tokens.output`, `tool_calls`, `tool_errors`, `provider_requests`, `provider_errors`, `context_compactions`, `security_events`, `verification_attempts`, `stalls`
+- Histograms: `run_duration`, `turn_duration`, `tool_call_duration`, `provider_latency`, `provider_ttfb`
+- Observable gauge: `context_tokens` (live per-run context window estimate, tagged with `run.id` and `run.mode`)
+
+**Traces**: a `run` root span per harness invocation, with `turn[N]` and `tool_call` child spans. Common attributes include `run.id`, `run.mode`, `run.provider`, `run.model`, `turn.number`, `turn.tokens.input`, `turn.tokens.output`, `tool.name`, `tool.success`.
+
+Stirrup currently routes its `slog` output to stderr rather than OTLP logs, so the log signal will normally be empty when Stirrup is the only source.
+
+### Claude Code (secondary)
 
 **Metrics** (8 counters): `claude_code.session.count`, `claude_code.lines_of_code.count`, `claude_code.pull_request.count`, `claude_code.commit.count`, `claude_code.cost.usage`, `claude_code.token.usage`, `claude_code.code_edit_tool.decision`, `claude_code.active_time.total`
 
-**Events** (5 types): `claude_code.user_prompt`, `claude_code.tool_result`, `claude_code.api_request`, `claude_code.api_error`, `claude_code.tool_decision`
+**Events** (5 types, carried as OTLP log records with an `event.name` attribute): `claude_code.user_prompt`, `claude_code.tool_result`, `claude_code.api_request`, `claude_code.api_error`, `claude_code.tool_decision`
 
 ## Development
 
