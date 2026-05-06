@@ -3,6 +3,7 @@ package sink_test
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -380,6 +381,47 @@ func TestRunBlock_ShutdownFlushesOpenRuns(t *testing.T) {
 	}
 }
 
+// TestRunBlock_ShutdownAfterRootEndDoesNotDuplicateBlock pins the
+// invariant that flushing a run via root-end clears its buffer and the
+// trace_id mapping, so a subsequent Shutdown does not re-flush the same
+// run as if it were still open. Without this guarantee a future refactor
+// could resurrect the run buffer after flush and emit a second
+// header/footer pair on shutdown for an already-closed run.
+func TestRunBlock_ShutdownAfterRootEndDoesNotDuplicateBlock(t *testing.T) {
+	var buf bytes.Buffer
+	stdout := sink.NewStdoutSink(&buf)
+	clock := newFakeClock(time.Unix(0, 1710504600000000000))
+	rb := mustNewRunBlockSink(t, stdout, sink.RunBlockConfig{
+		Mode:        sink.RunBlockModeGrouped,
+		IdleTimeout: time.Hour,
+		MaxItems:    100,
+		Clock:       clock,
+		Logger:      quietRunblockLogger(),
+	})
+
+	traceID := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+	rootID := []byte{0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8}
+	root := makeRootRunSpan(traceID, rootID, 1710504600000000000, "abc",
+		stringAttr("run.outcome", "success"),
+	)
+	if err := rb.ConsumeTraces(context.Background(), wrapSpans(root)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Root-end has flushed the run; the buffer for "abc" should be gone.
+	if err := rb.Shutdown(context.Background()); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+
+	out := buf.String()
+	if got := strings.Count(out, "=== run abc started"); got != 1 {
+		t.Errorf("expected exactly one header for run abc, got %d in:\n%s", got, out)
+	}
+	if got := strings.Count(out, "=== run abc finished"); got != 1 {
+		t.Errorf("expected exactly one footer for run abc, got %d in:\n%s", got, out)
+	}
+}
+
 // TestRunBlock_ShutdownIsIdempotent guards against the previous bug where a
 // second Shutdown closed an already-closed stopCh and panicked. main.go's
 // shutdown path defers a best-effort Shutdown and then calls Shutdown again
@@ -588,6 +630,123 @@ func TestRunBlock_ConcurrentUseRaceFree(t *testing.T) {
 	}
 	if buf.Len() == 0 {
 		t.Errorf("expected bypass spans to be visible in stdout")
+	}
+}
+
+// TestRunBlock_ConcurrentDistinctRunIDsRaceFree exercises the per-run.id
+// bucketing logic under concurrent producers, each operating on its own
+// run.id. The sweeper runs throughout (low IdleTimeout) so a run that's
+// been idle for too long can flush concurrently with another goroutine
+// still producing for a different run. The race detector enforces
+// memory-model correctness; this test additionally asserts that each run's
+// rendered block is contiguous in the output (no header/body interleaving
+// across runs) and that body items inside a run remain in timestamp order.
+func TestRunBlock_ConcurrentDistinctRunIDsRaceFree(t *testing.T) {
+	buf := &syncBuffer{}
+	stdout := sink.NewStdoutSink(buf)
+	clock := newFakeClock(time.Unix(0, 1710504600000000000))
+	rb := mustNewRunBlockSink(t, stdout, sink.RunBlockConfig{
+		Mode: sink.RunBlockModeGrouped,
+		// Short idle timeout so the sweeper participates in flushing.
+		IdleTimeout: 200 * time.Millisecond,
+		MaxItems:    1000,
+		Clock:       clock,
+		Logger:      quietRunblockLogger(),
+	})
+
+	const goroutines = 8
+	const itemsPerRun = 15
+
+	type runResult struct {
+		runID  string
+		traceID []byte
+	}
+	results := make([]runResult, goroutines)
+	for g := 0; g < goroutines; g++ {
+		results[g] = runResult{
+			runID:  fmt.Sprintf("run-%02d", g),
+			traceID: []byte{byte(g + 1), 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+		}
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for g := 0; g < goroutines; g++ {
+		g := g
+		go func() {
+			defer wg.Done()
+			r := results[g]
+			// Send the run's root span first so the run.id<->trace_id map is
+			// populated; the buffer order in the rendered block is decided
+			// by item timestamps, not arrival order.
+			rootID := []byte{0xa0, byte(g), 0, 0, 0, 0, 0, 1}
+			root := makeRootRunSpan(r.traceID, rootID,
+				uint64(1710504600000000000+int64(g)*1_000),
+				r.runID,
+			)
+			_ = rb.ConsumeTraces(context.Background(), wrapSpans(root))
+
+			for i := 0; i < itemsPerRun; i++ {
+				ts := uint64(1710504600000000000 + int64(g)*1_000 + int64(i+1)*100)
+				span := makeChildSpan(fmt.Sprintf("turn[%d]", i), r.traceID,
+					[]byte{byte(g), byte(i), 1, 2, 3, 4, 5, 6}, rootID,
+					ts, stringAttr("run.id", r.runID),
+				)
+				_ = rb.ConsumeTraces(context.Background(), wrapSpans(span))
+			}
+
+			// Close the run so its block flushes deterministically rather
+			// than relying on shutdown ordering.
+			endID := []byte{0xee, byte(g), 0, 0, 0, 0, 0, 1}
+			end := makeRootRunSpan(r.traceID, endID,
+				uint64(1710504600000000000+int64(g)*1_000+int64(itemsPerRun+1)*100),
+				r.runID,
+				stringAttr("run.outcome", "success"),
+			)
+			_ = rb.ConsumeTraces(context.Background(), wrapSpans(end))
+		}()
+	}
+	wg.Wait()
+
+	// Final shutdown to drain anything the sweeper might still be holding.
+	if err := rb.Shutdown(context.Background()); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+
+	out := buf.String()
+
+	// Every run.id must appear exactly once as a header and once as a footer,
+	// and every header must be followed by its own footer with no other run's
+	// header in between.
+	for _, r := range results {
+		startMarker := fmt.Sprintf("=== run %s started", r.runID)
+		endMarker := fmt.Sprintf("=== run %s finished", r.runID)
+		startIdx := strings.Index(out, startMarker)
+		endIdx := strings.Index(out, endMarker)
+		if startIdx < 0 {
+			t.Errorf("missing header for %s", r.runID)
+			continue
+		}
+		if endIdx < 0 {
+			t.Errorf("missing footer for %s", r.runID)
+			continue
+		}
+		if endIdx < startIdx {
+			t.Errorf("footer for %s precedes its header", r.runID)
+			continue
+		}
+		// Slice from header to footer (exclusive of footer to avoid the
+		// next run's header showing up if it shares text). No other run's
+		// header should appear inside this window.
+		block := out[startIdx:endIdx]
+		for _, other := range results {
+			if other.runID == r.runID {
+				continue
+			}
+			if strings.Contains(block, fmt.Sprintf("=== run %s started", other.runID)) {
+				t.Errorf("run %s block interleaves run %s's header", r.runID, other.runID)
+			}
+		}
 	}
 }
 
