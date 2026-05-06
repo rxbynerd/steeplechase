@@ -17,6 +17,7 @@ import (
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	logspb "go.opentelemetry.io/proto/otlp/logs/v1"
 	metricspb "go.opentelemetry.io/proto/otlp/metrics/v1"
+	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 
 	"github.com/rxbynerd/steeplechase/internal/sink"
@@ -547,6 +548,311 @@ func TestRunBlock_LogsAndMetrics(t *testing.T) {
 		}
 	}
 }
+
+// TestRunBlock_LogRunIDOnScopeAttrs verifies that ConsumeLogs walks past
+// the LogRecord attributes layer when no run.id is present and picks up
+// the scope-level run.id. Without this branch covered, the lookup chain
+// (record -> scope -> resource) could regress to record-only and silently
+// stop bucketing entire log batches that scope-tag their telemetry (a
+// shape we expect from libraries that set run.id once per scope).
+func TestRunBlock_LogRunIDOnScopeAttrs(t *testing.T) {
+	var buf bytes.Buffer
+	stdout := sink.NewStdoutSink(&buf)
+	clock := newFakeClock(time.Unix(0, 1710504600000000000))
+	rb := mustNewRunBlockSink(t, stdout, sink.RunBlockConfig{
+		Mode:        sink.RunBlockModeGrouped,
+		IdleTimeout: time.Hour,
+		MaxItems:    100,
+		Clock:       clock,
+		Logger:      quietRunblockLogger(),
+	})
+	defer rb.Shutdown(context.Background())
+
+	rec := &logspb.LogRecord{
+		TimeUnixNano: 1710504600100000000,
+		Body:         &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "scope-tagged"}},
+	}
+	req := &collogspb.ExportLogsServiceRequest{
+		ResourceLogs: []*logspb.ResourceLogs{{
+			ScopeLogs: []*logspb.ScopeLogs{{
+				Scope: &commonpb.InstrumentationScope{
+					Name:       "stirrup",
+					Attributes: []*commonpb.KeyValue{stringAttr("run.id", "abc")},
+				},
+				LogRecords: []*logspb.LogRecord{rec},
+			}},
+		}},
+	}
+	if err := rb.ConsumeLogs(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	// Output should still be empty — the log was buffered, not bypassed.
+	if buf.Len() != 0 {
+		t.Fatalf("scope-tagged log should buffer; got line-mode output: %q", buf.String())
+	}
+
+	// Flush via root-end and check the log appears inside the block.
+	traceID := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+	rootID := []byte{0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8}
+	root := makeRootRunSpan(traceID, rootID, 1710504600000000000, "abc",
+		stringAttr("run.outcome", "success"),
+	)
+	if err := rb.ConsumeTraces(context.Background(), wrapSpans(root)); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "=== run abc started") || !strings.Contains(out, "scope-tagged") {
+		t.Errorf("scope-tagged log missing from run block: %q", out)
+	}
+}
+
+// TestRunBlock_LogRunIDOnResourceAttrs covers the third (and outermost)
+// rung of the run.id lookup chain: ResourceLogs.Resource.Attributes. A
+// regression here would leak resource-tagged log batches into line mode.
+func TestRunBlock_LogRunIDOnResourceAttrs(t *testing.T) {
+	var buf bytes.Buffer
+	stdout := sink.NewStdoutSink(&buf)
+	clock := newFakeClock(time.Unix(0, 1710504600000000000))
+	rb := mustNewRunBlockSink(t, stdout, sink.RunBlockConfig{
+		Mode:        sink.RunBlockModeGrouped,
+		IdleTimeout: time.Hour,
+		MaxItems:    100,
+		Clock:       clock,
+		Logger:      quietRunblockLogger(),
+	})
+	defer rb.Shutdown(context.Background())
+
+	rec := &logspb.LogRecord{
+		TimeUnixNano: 1710504600100000000,
+		Body:         &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "resource-tagged"}},
+	}
+	req := &collogspb.ExportLogsServiceRequest{
+		ResourceLogs: []*logspb.ResourceLogs{{
+			Resource: &resourcepb.Resource{
+				Attributes: []*commonpb.KeyValue{stringAttr("run.id", "abc")},
+			},
+			ScopeLogs: []*logspb.ScopeLogs{{
+				LogRecords: []*logspb.LogRecord{rec},
+			}},
+		}},
+	}
+	if err := rb.ConsumeLogs(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("resource-tagged log should buffer; got line-mode output: %q", buf.String())
+	}
+
+	traceID := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+	rootID := []byte{0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8}
+	root := makeRootRunSpan(traceID, rootID, 1710504600000000000, "abc",
+		stringAttr("run.outcome", "success"),
+	)
+	if err := rb.ConsumeTraces(context.Background(), wrapSpans(root)); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "=== run abc started") || !strings.Contains(out, "resource-tagged") {
+		t.Errorf("resource-tagged log missing from run block: %q", out)
+	}
+}
+
+// TestRunBlock_MetricRunIDOnResourceAttrs verifies the metric path falls
+// back to ResourceMetrics.Resource.Attributes when the data point itself
+// carries no run.id. Each split*Points helper checks the resource fallback;
+// this test pins the contract for at least one of them so a future
+// refactor that drops the fallback gets caught by CI.
+func TestRunBlock_MetricRunIDOnResourceAttrs(t *testing.T) {
+	var buf bytes.Buffer
+	stdout := sink.NewStdoutSink(&buf)
+	clock := newFakeClock(time.Unix(0, 1710504600000000000))
+	rb := mustNewRunBlockSink(t, stdout, sink.RunBlockConfig{
+		Mode:        sink.RunBlockModeGrouped,
+		IdleTimeout: time.Hour,
+		MaxItems:    100,
+		Clock:       clock,
+		Logger:      quietRunblockLogger(),
+	})
+	defer rb.Shutdown(context.Background())
+
+	dp := &metricspb.NumberDataPoint{
+		TimeUnixNano: 1710504600200000000,
+		Value:        &metricspb.NumberDataPoint_AsInt{AsInt: 42},
+	}
+	req := &colmetricspb.ExportMetricsServiceRequest{
+		ResourceMetrics: []*metricspb.ResourceMetrics{{
+			Resource: &resourcepb.Resource{
+				Attributes: []*commonpb.KeyValue{stringAttr("run.id", "abc")},
+			},
+			ScopeMetrics: []*metricspb.ScopeMetrics{{
+				Metrics: []*metricspb.Metric{{
+					Name: "stirrup.harness.tokens.input",
+					Data: &metricspb.Metric_Sum{Sum: &metricspb.Sum{
+						DataPoints: []*metricspb.NumberDataPoint{dp},
+					}},
+				}},
+			}},
+		}},
+	}
+	if err := rb.ConsumeMetrics(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("resource-tagged metric should buffer; got: %q", buf.String())
+	}
+
+	traceID := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+	rootID := []byte{0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8}
+	root := makeRootRunSpan(traceID, rootID, 1710504600000000000, "abc",
+		stringAttr("run.outcome", "success"),
+	)
+	if err := rb.ConsumeTraces(context.Background(), wrapSpans(root)); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "stirrup.harness.tokens.input") {
+		t.Errorf("resource-tagged metric missing from run block: %q", out)
+	}
+}
+
+// TestRunBlock_NonNumberMetricsOverflowBypass exercises the Histogram,
+// Summary, and ExponentialHistogram arms of buildSingleMetricProto. The
+// existing overflow test only sends Sum-shaped points, so a refactor that
+// drops one of the other arms (returning nil from the default case in
+// buildSingleMetricProto) would silently lose the post-overflow data
+// points without any test catching it. We trigger overflow with MaxItems=1
+// to guarantee the second point routes through the streamSingleMetric
+// bypass, which is the path that exercises buildSingleMetricProto.
+func TestRunBlock_NonNumberMetricsOverflowBypass(t *testing.T) {
+	traceID := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+	_ = traceID
+
+	tests := []struct {
+		name     string
+		buildReq func(ts uint64) *colmetricspb.ExportMetricsServiceRequest
+		expect   string
+	}{
+		{
+			name: "Histogram",
+			buildReq: func(ts uint64) *colmetricspb.ExportMetricsServiceRequest {
+				dp := &metricspb.HistogramDataPoint{
+					TimeUnixNano:   ts,
+					Count:          3,
+					Sum:            ptrFloat(1.5),
+					BucketCounts:   []uint64{1, 1, 1},
+					ExplicitBounds: []float64{0.5, 1.0},
+					Attributes:     []*commonpb.KeyValue{stringAttr("run.id", "abc")},
+				}
+				return &colmetricspb.ExportMetricsServiceRequest{
+					ResourceMetrics: []*metricspb.ResourceMetrics{{
+						ScopeMetrics: []*metricspb.ScopeMetrics{{
+							Metrics: []*metricspb.Metric{{
+								Name: "stirrup.harness.histogram",
+								Data: &metricspb.Metric_Histogram{Histogram: &metricspb.Histogram{
+									DataPoints: []*metricspb.HistogramDataPoint{dp},
+								}},
+							}},
+						}},
+					}},
+				}
+			},
+			expect: "stirrup.harness.histogram",
+		},
+		{
+			name: "Summary",
+			buildReq: func(ts uint64) *colmetricspb.ExportMetricsServiceRequest {
+				dp := &metricspb.SummaryDataPoint{
+					TimeUnixNano: ts,
+					Count:        2,
+					Sum:          1.0,
+					Attributes:   []*commonpb.KeyValue{stringAttr("run.id", "abc")},
+				}
+				return &colmetricspb.ExportMetricsServiceRequest{
+					ResourceMetrics: []*metricspb.ResourceMetrics{{
+						ScopeMetrics: []*metricspb.ScopeMetrics{{
+							Metrics: []*metricspb.Metric{{
+								Name: "stirrup.harness.summary",
+								Data: &metricspb.Metric_Summary{Summary: &metricspb.Summary{
+									DataPoints: []*metricspb.SummaryDataPoint{dp},
+								}},
+							}},
+						}},
+					}},
+				}
+			},
+			expect: "stirrup.harness.summary",
+		},
+		{
+			name: "ExponentialHistogram",
+			buildReq: func(ts uint64) *colmetricspb.ExportMetricsServiceRequest {
+				dp := &metricspb.ExponentialHistogramDataPoint{
+					TimeUnixNano: ts,
+					Count:        2,
+					Sum:          ptrFloat(0.5),
+					Scale:        0,
+					Attributes:   []*commonpb.KeyValue{stringAttr("run.id", "abc")},
+				}
+				return &colmetricspb.ExportMetricsServiceRequest{
+					ResourceMetrics: []*metricspb.ResourceMetrics{{
+						ScopeMetrics: []*metricspb.ScopeMetrics{{
+							Metrics: []*metricspb.Metric{{
+								Name: "stirrup.harness.exphist",
+								Data: &metricspb.Metric_ExponentialHistogram{ExponentialHistogram: &metricspb.ExponentialHistogram{
+									DataPoints: []*metricspb.ExponentialHistogramDataPoint{dp},
+								}},
+							}},
+						}},
+					}},
+				}
+			},
+			expect: "stirrup.harness.exphist",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			stdout := sink.NewStdoutSink(&buf)
+			clock := newFakeClock(time.Unix(0, 1710504600000000000))
+			rb := mustNewRunBlockSink(t, stdout, sink.RunBlockConfig{
+				Mode:        sink.RunBlockModeGrouped,
+				IdleTimeout: time.Hour,
+				MaxItems:    1,
+				Clock:       clock,
+				Logger:      quietRunblockLogger(),
+			})
+			defer rb.Shutdown(context.Background())
+
+			// First point fills the buffer to MaxItems.
+			if err := rb.ConsumeMetrics(context.Background(), tc.buildReq(1710504600100000000)); err != nil {
+				t.Fatal(err)
+			}
+			// Second point triggers overflow and streams via the bypass.
+			if err := rb.ConsumeMetrics(context.Background(), tc.buildReq(1710504600200000000)); err != nil {
+				t.Fatal(err)
+			}
+
+			out := buf.String()
+			if !strings.Contains(out, "[WARN] run abc truncated") {
+				t.Errorf("expected truncation warning, got %q", out)
+			}
+			// The bypass-routed second point must appear after the warning.
+			warnIdx := strings.Index(out, "[WARN]")
+			postWarn := out[warnIdx:]
+			if !strings.Contains(postWarn, tc.expect) {
+				t.Errorf("expected %q after truncation warning, got %q", tc.expect, postWarn)
+			}
+			// And the metric line must not have been silently dropped (which
+			// would happen if buildSingleMetricProto's relevant arm was lost).
+			if got := strings.Count(out, tc.expect); got < 2 {
+				t.Errorf("expected metric name %q at least twice (once buffered, once bypass), got %d in %q", tc.expect, got, out)
+			}
+		})
+	}
+}
+
+// ptrFloat is a tiny helper for proto fields whose Sum is a *float64.
+func ptrFloat(v float64) *float64 { return &v }
 
 func TestRunBlock_LogWithoutRunIDBypasses(t *testing.T) {
 	var buf bytes.Buffer
