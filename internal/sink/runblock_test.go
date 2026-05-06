@@ -549,6 +549,49 @@ func TestRunBlock_LogsAndMetrics(t *testing.T) {
 	}
 }
 
+// TestRunBlock_MetricsOnlyRunFlushesOnShutdown covers the corner where a
+// run never produces any spans or logs — only metrics — and is closed by
+// shutdown rather than a root-end signal. Without this test a regression
+// that conditioned the buffer-open-on-first-item logic on traces or logs
+// (rather than any item kind) would silently drop metrics-only runs.
+func TestRunBlock_MetricsOnlyRunFlushesOnShutdown(t *testing.T) {
+	var buf bytes.Buffer
+	stdout := sink.NewStdoutSink(&buf)
+	clock := newFakeClock(time.Unix(0, 1710504600000000000))
+	rb := mustNewRunBlockSink(t, stdout, sink.RunBlockConfig{
+		Mode:        sink.RunBlockModeGrouped,
+		IdleTimeout: time.Hour,
+		MaxItems:    100,
+		Clock:       clock,
+		Logger:      quietRunblockLogger(),
+	})
+
+	dp := &metricspb.NumberDataPoint{
+		TimeUnixNano: 1710504600200000000,
+		Value:        &metricspb.NumberDataPoint_AsInt{AsInt: 42},
+		Attributes:   []*commonpb.KeyValue{stringAttr("run.id", "abc")},
+	}
+	if err := rb.ConsumeMetrics(context.Background(), wrapMetric("stirrup.harness.tokens.input", dp, true)); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := rb.Shutdown(context.Background()); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, "=== run abc started") {
+		t.Errorf("metrics-only run must still emit a header on shutdown: %q", out)
+	}
+	if !strings.Contains(out, "stirrup.harness.tokens.input") {
+		t.Errorf("metric line missing from metrics-only run block: %q", out)
+	}
+	// Shutdown is treated as an idle-style flush: outcome unknown.
+	if !strings.Contains(out, "outcome=<unknown>") {
+		t.Errorf("metrics-only run on shutdown should report outcome=<unknown>: %q", out)
+	}
+}
+
 // TestRunBlock_LogRunIDOnScopeAttrs verifies that ConsumeLogs walks past
 // the LogRecord attributes layer when no run.id is present and picks up
 // the scope-level run.id. Without this branch covered, the lookup chain

@@ -161,6 +161,118 @@ func TestRenderRunBlock_Tree_OrphanSpansAtDepthZero(t *testing.T) {
 	}
 }
 
+// TestRenderRunBlock_Tree_MultipleDisconnectedSubtrees verifies that two
+// independent (orphan) parent spans render at depth 0 and each of their
+// children renders at depth 1. The previous tree tests covered a single
+// connected tree only; without this case a regression that conflated the
+// two trees (e.g. depth computed against the buffer's earliest span
+// rather than the parent edge) would not be caught.
+func TestRenderRunBlock_Tree_MultipleDisconnectedSubtrees(t *testing.T) {
+	traceID := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+
+	parentA := []byte{0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8}
+	childA := []byte{0xa9, 0xaa, 0xab, 0xac, 0xad, 0xae, 0xaf, 0xb0}
+	parentB := []byte{0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8}
+	childB := []byte{0xb9, 0xba, 0xbb, 0xbc, 0xbd, 0xbe, 0xbf, 0xc0}
+
+	pA := makeSpan("parent_a", traceID, parentA, nil, 1710504600000000000)
+	cA := makeSpan("child_a", traceID, childA, parentA, 1710504601000000000)
+	pB := makeSpan("parent_b", traceID, parentB, nil, 1710504602000000000)
+	cB := makeSpan("child_b", traceID, childB, parentB, 1710504603000000000)
+
+	items := []RunBlockItem{
+		{Timestamp: pA.StartTimeUnixNano, Kind: RunBlockItemSpan, Span: pA},
+		{Timestamp: cA.StartTimeUnixNano, Kind: RunBlockItemSpan, Span: cA},
+		{Timestamp: pB.StartTimeUnixNano, Kind: RunBlockItemSpan, Span: pB},
+		{Timestamp: cB.StartTimeUnixNano, Kind: RunBlockItemSpan, Span: cB},
+	}
+	lines := RenderRunBlock(RunBlockTree, RunBlockHeader{RunID: "abc"}, items, RunBlockFooter{RunID: "abc"})
+	if len(lines) != 6 {
+		t.Fatalf("expected 6 lines (header+4 items+footer), got %d: %q", len(lines), lines)
+	}
+	// Both parents at depth 0; both children at depth 1. The line shape
+	// "[TRACE]  " followed by depth*2 spaces puts depth-0 lines at "[TRACE]  2024-"
+	// and depth-1 lines at "[TRACE]    2024-".
+	if !strings.HasPrefix(lines[1], "[TRACE]  2024-") || !strings.Contains(lines[1], "parent_a") {
+		t.Errorf("parent_a should render at depth 0: %q", lines[1])
+	}
+	if !strings.HasPrefix(lines[2], "[TRACE]    2024-") || !strings.Contains(lines[2], "child_a") {
+		t.Errorf("child_a should render at depth 1: %q", lines[2])
+	}
+	if !strings.HasPrefix(lines[3], "[TRACE]  2024-") || !strings.Contains(lines[3], "parent_b") {
+		t.Errorf("parent_b should render at depth 0: %q", lines[3])
+	}
+	if !strings.HasPrefix(lines[4], "[TRACE]    2024-") || !strings.Contains(lines[4], "child_b") {
+		t.Errorf("child_b should render at depth 1: %q", lines[4])
+	}
+}
+
+// TestRenderRunBlock_Tree_CycleProtection ensures computeSpanDepths does
+// not infinite-recurse if two spans claim each other as parents (an
+// invalid but possible OTLP shape from a buggy producer). The "hops >
+// len(spans)" guard inside resolve terminates the recursion. We assert
+// the renderer returns and that neither span vanishes from the output.
+//
+// Note on depth: the current guard prevents stack overflow but does not
+// guarantee depth=0 for the cycle's nodes — once the budget fires, the
+// memoised zero gets overwritten on the unwind, so the visible depth is
+// bounded but non-zero. That bound is what we assert here; if a future
+// change makes the cycle's nodes render at the bounded depth or at zero
+// the test stays passing as long as termination holds.
+func TestRenderRunBlock_Tree_CycleProtection(t *testing.T) {
+	traceID := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+	spanA := []byte{0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa}
+	spanB := []byte{0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb}
+
+	// A's parent is B; B's parent is A. A direct cycle.
+	a := makeSpan("cycle_a", traceID, spanA, spanB, 1710504600000000000)
+	b := makeSpan("cycle_b", traceID, spanB, spanA, 1710504601000000000)
+
+	items := []RunBlockItem{
+		{Timestamp: a.StartTimeUnixNano, Kind: RunBlockItemSpan, Span: a},
+		{Timestamp: b.StartTimeUnixNano, Kind: RunBlockItemSpan, Span: b},
+	}
+	// The primary assertion is termination: if computeSpanDepths regressed
+	// and entered an unbounded recursion, Go would surface a stack overflow
+	// rather than reaching the assertions below.
+	lines := RenderRunBlock(RunBlockTree, RunBlockHeader{RunID: "abc"}, items, RunBlockFooter{RunID: "abc"})
+	if len(lines) != 4 {
+		t.Fatalf("expected 4 lines (header+2 items+footer), got %d: %q", len(lines), lines)
+	}
+	// Both span names must appear — neither should be silently dropped.
+	body := lines[1] + "\n" + lines[2]
+	if !strings.Contains(body, "cycle_a") {
+		t.Errorf("cycle_a missing from rendered output: %q", body)
+	}
+	if !strings.Contains(body, "cycle_b") {
+		t.Errorf("cycle_b missing from rendered output: %q", body)
+	}
+	// And the visible indent depth must be bounded by len(spans); without
+	// the guard the recursion would never have stopped to produce a finite
+	// depth. We allow up to len(spans)+1 levels (the depth at which the
+	// guard fires and the unwind kicks in), which gives the renderer the
+	// freedom to choose any reasonable cycle-handling policy short of
+	// hanging.
+	for i, line := range []string{lines[1], lines[2]} {
+		const tracePrefix = "[TRACE]  "
+		idx := strings.Index(line, "2024-")
+		if idx < 0 {
+			t.Errorf("line %d missing timestamp marker: %q", i+1, line)
+			continue
+		}
+		indentLen := idx - len(tracePrefix)
+		if indentLen < 0 || indentLen%2 != 0 {
+			t.Errorf("line %d has malformed indent (len=%d): %q", i+1, indentLen, line)
+			continue
+		}
+		// len(spans) = 2, so depth budget caps at 2; the unwind can produce
+		// up to depth 3 (root + len(spans) increments). Indent is depth*2.
+		if indentLen > 6 {
+			t.Errorf("line %d indent %d exceeds cycle-bounded budget: %q", i+1, indentLen, line)
+		}
+	}
+}
+
 func TestRenderRunBlock_Tree_LogsAndMetricsRemainFlat(t *testing.T) {
 	traceID := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
 	rootID := []byte{0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8}
