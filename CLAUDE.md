@@ -25,7 +25,8 @@ go mod tidy       # After dependency changes
 - `internal/sink/otlp_forward_grpc.go` - gRPC transport (TLS, gzip, headers, keepalive)
 - `internal/sink/otlp_forward_http.go` - HTTP transport (TLS, gzip, headers, retry classification)
 - `internal/sink/retry.go` - Exponential backoff + `permanentError` sentinel
-- `internal/sink/dsn.go` - `ParseDSN` for `stdout`, `otlp+grpc://`, `otlp+http://`, `otlp+https://`
+- `internal/sink/dsn.go` - `ParseDSN` for `stdout`, `otlp+grpc://`, `otlp+http://`, `otlp+https://`, `mqtt://`
+- `internal/sink/mqtt.go` - MQTT sink that publishes protobuf OTLP requests to `<topic>/metrics`, `<topic>/logs`, `<topic>/traces`
 - `internal/sinktest/` - Shared test fakes: `RecordingSink`, `ErrorSink`, `SlowSink`
 - `internal/receiver/grpc.go` - gRPC server on :4317, observes receiver metrics
 - `internal/receiver/http.go` - HTTP server on :4318 (protobuf + JSON), observes receiver metrics
@@ -40,6 +41,7 @@ go mod tidy       # After dependency changes
 - Go module: `github.com/rxbynerd/steeplechase`
 - Sink interface takes full proto request objects, not extracted fields
 - Sinks must be safe for concurrent use; `Name()` returns the metric/log label; `Shutdown()` releases resources
+- MQTT sinks publish the original OTLP protobuf export request bytes under a configured base topic suffixed by signal; do not extract or reformat telemetry there
 - Fan-out is best-effort: FanoutSink returns nil unless every child fails, keeping upstream retries from duplicating into healthy sinks
 - HTTP Content-Type dispatch: `application/x-protobuf` or `application/json`
 - DSN is the configuration surface. If options grow beyond what CLI flags handle, use TOML or HCLv2, **not** YAML or JSON
