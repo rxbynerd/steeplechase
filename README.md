@@ -21,6 +21,17 @@ Forward to another OTLP backend while also printing locally:
   --sink 'otlp+grpc://vector.internal:4317?compression=gzip&header=x-api-key:secret'
 ```
 
+Publish every received OTLP payload to an MQTT broker:
+
+```bash
+./bin/steeplechase \
+  --sink 'mqtt://telemetry:secret@mqtt.internal:1883/coding-harness/otel'
+```
+
+The MQTT sink publishes protobuf-encoded OTLP export requests to
+`coding-harness/otel/metrics`, `coding-harness/otel/logs`, and
+`coding-harness/otel/traces`.
+
 ### Pointing Stirrup at Steeplechase
 
 ```bash
@@ -80,6 +91,7 @@ stdout                                         # write to process stdout
 otlp+grpc://HOST:PORT[?k=v&...]                # forward over OTLP gRPC
 otlp+http://HOST:PORT[/BASE][?k=v&...]         # forward over OTLP HTTP (plaintext)
 otlp+https://HOST:PORT[/BASE][?k=v&...]        # forward over OTLP HTTP with TLS
+mqtt://[USER:PASS@]HOST:PORT/TOPIC[?k=v&...]   # publish OTLP protobuf to MQTT
 ```
 
 Query parameters (all optional):
@@ -96,8 +108,17 @@ Query parameters (all optional):
 | `retry_max_interval` | `10s` | Cap on any single backoff |
 | `retry_max_elapsed` | `30s` | Total retry budget per call |
 | `keepalive` | off | gRPC client keepalive ping interval |
+| `qos` | `1` | MQTT publish QoS: `0`, `1`, or `2` |
+| `retained` | `false` | MQTT retained publish flag |
+| `client_id` | generated | MQTT client identifier |
 
 Unknown query keys cause startup to fail loudly, so typos become hard errors instead of silently-dropped configuration.
+
+MQTT sink passwords are accepted in the DSN user-info section and are redacted
+from startup errors and logs. The configured `TOPIC` is a base topic; metrics,
+logs, and traces are published under `/metrics`, `/logs`, and `/traces`
+respectively. MQTT publish wildcard characters (`+`, `#`) are rejected in the
+base topic.
 
 ## Admin Endpoints
 
