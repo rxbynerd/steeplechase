@@ -37,7 +37,7 @@ func main() {
 	grpcAddr := flag.String("grpc-addr", ":4317", "gRPC listen address")
 	httpAddr := flag.String("http-addr", ":4318", "HTTP listen address")
 	adminAddr := flag.String("admin-addr", ":9090", "Admin HTTP listen address (/healthz, /readyz, /metrics)")
-	flag.Var(&sinks, "sink", "Sink DSN (repeatable). Examples: stdout, otlp+grpc://host:4317, otlp+http://host:4318?header=x-api-key:... . If omitted, defaults to stdout.")
+	flag.Var(&sinks, "sink", "Sink DSN (repeatable). Examples: stdout, otlp+grpc://host:4317, otlp+http://host:4318?header=x-api-key:..., mqtt://user:pass@host:1883/topic . If omitted, defaults to stdout.")
 	// stdout-format/run-timeout/run-max-items belong together: they
 	// configure how a run.id-aware stdout sink groups telemetry into
 	// per-run blocks. Defaults preserve today's line-by-line behaviour.
@@ -227,12 +227,12 @@ func buildPipeline(dsns []string, rec *metrics.Recorder, logger *slog.Logger, st
 			s, err := sink.ParseDSN(dsn)
 			if err != nil {
 				teardown()
-				return nil, nil, fmt.Errorf("parse sink %q: %w", dsn, err)
+				return nil, nil, fmt.Errorf("parse sink %q: %w", sink.RedactDSN(dsn), err)
 			}
 			wrapped, err := maybeWrap(s)
 			if err != nil {
 				teardown()
-				return nil, nil, fmt.Errorf("wrap sink %q: %w", dsn, err)
+				return nil, nil, fmt.Errorf("wrap sink %q: %w", sink.RedactDSN(dsn), err)
 			}
 			leaves = append(leaves, sink.NewMeteredSink(wrapped, rec))
 			names = append(names, s.Name())

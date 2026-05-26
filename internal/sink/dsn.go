@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -14,6 +15,7 @@ import (
 //	otlp+grpc://HOST:PORT[?k=v&...]           -> gRPC OTLPForwardSink
 //	otlp+http://HOST:PORT[/BASE][?k=v&...]    -> HTTP OTLPForwardSink (plaintext)
 //	otlp+https://HOST:PORT[/BASE][?k=v&...]   -> HTTP OTLPForwardSink over TLS
+//	mqtt://[USER:PASS@]HOST:PORT/TOPIC[?k=v&...] -> MQTT MQTTSink
 //
 // Common query parameters (all optional):
 //
@@ -27,6 +29,9 @@ import (
 //	retry_max_interval=<dur>  cap on any single backoff (default 10s)
 //	retry_max_elapsed=<dur>   total retry budget (default 30s)
 //	keepalive=<duration>      grpc only, 0 disables
+//	qos=0|1|2                 mqtt only, default 1
+//	retained=true|false       mqtt only, default false
+//	client_id=<string>        mqtt only, default generated
 //
 // Unknown schemes and unknown query parameters cause ParseDSN to return an
 // error rather than silently ignoring them — failing loud on DSN typos is
@@ -40,11 +45,11 @@ func ParseDSN(dsn string) (Sink, error) {
 		return NewStdoutSink(os.Stdout), nil
 	}
 
-	// Parse as URL. The otlp+grpc / otlp+http / otlp+https schemes use the
-	// compound form so we split on the first "+".
+	// Parse as URL. OTLP forwarding schemes use compound scheme names such as
+	// otlp+grpc; net/url preserves those unchanged for the switch below.
 	u, err := url.Parse(dsn)
 	if err != nil {
-		return nil, fmt.Errorf("sink dsn %q: %w", dsn, err)
+		return nil, fmt.Errorf("sink dsn %q: %w", RedactDSN(dsn), err)
 	}
 
 	switch u.Scheme {
@@ -52,9 +57,20 @@ func ParseDSN(dsn string) (Sink, error) {
 		return parseGRPCDSN(u)
 	case "otlp+http", "otlp+https":
 		return parseHTTPDSN(u)
+	case "mqtt":
+		return parseMQTTDSN(u)
 	default:
-		return nil, fmt.Errorf("sink dsn %q: unknown scheme %q (want stdout, otlp+grpc, otlp+http, otlp+https)", dsn, u.Scheme)
+		return nil, fmt.Errorf("sink dsn %q: unknown scheme %q (want stdout, otlp+grpc, otlp+http, otlp+https, mqtt)", RedactDSN(dsn), u.Scheme)
 	}
+}
+
+// RedactDSN returns dsn with any password component hidden for logs and errors.
+func RedactDSN(dsn string) string {
+	u, err := url.Parse(strings.TrimSpace(dsn))
+	if err != nil || u.User == nil {
+		return dsn
+	}
+	return u.Redacted()
 }
 
 // knownGRPCKeys is the closed set of DSN query parameters recognised by the
@@ -85,9 +101,21 @@ var knownHTTPKeys = map[string]struct{}{
 	"retry_max_elapsed":  {},
 }
 
+// knownMQTTKeys is the closed set for the mqtt sink.
+var knownMQTTKeys = map[string]struct{}{
+	"name":               {},
+	"timeout":            {},
+	"retry_initial":      {},
+	"retry_max_interval": {},
+	"retry_max_elapsed":  {},
+	"qos":                {},
+	"retained":           {},
+	"client_id":          {},
+}
+
 func parseGRPCDSN(u *url.URL) (Sink, error) {
 	if u.Host == "" {
-		return nil, fmt.Errorf("sink dsn %q: missing host:port", u.String())
+		return nil, fmt.Errorf("sink dsn %q: missing host:port", redactedURL(u))
 	}
 	q, err := parseQuery(u, knownGRPCKeys)
 	if err != nil {
@@ -118,7 +146,7 @@ func parseGRPCDSN(u *url.URL) (Sink, error) {
 
 func parseHTTPDSN(u *url.URL) (Sink, error) {
 	if u.Host == "" {
-		return nil, fmt.Errorf("sink dsn %q: missing host:port", u.String())
+		return nil, fmt.Errorf("sink dsn %q: missing host:port", redactedURL(u))
 	}
 	q, err := parseQuery(u, knownHTTPKeys)
 	if err != nil {
@@ -159,6 +187,71 @@ func parseHTTPDSN(u *url.URL) (Sink, error) {
 	return NewOTLPForwardSink(name, t, buildRetryConfig(q)), nil
 }
 
+func parseMQTTDSN(u *url.URL) (Sink, error) {
+	if u.Host == "" || u.Hostname() == "" || u.Port() == "" {
+		return nil, fmt.Errorf("sink dsn %q: missing host:port", redactedURL(u))
+	}
+	if u.Fragment != "" {
+		return nil, fmt.Errorf("sink dsn %q: mqtt topic must not use URL fragments", redactedURL(u))
+	}
+
+	baseTopic := strings.Trim(u.Path, "/")
+	if baseTopic == "" {
+		return nil, fmt.Errorf("sink dsn %q: missing mqtt topic", redactedURL(u))
+	}
+	if strings.ContainsAny(baseTopic, "+#") {
+		return nil, fmt.Errorf("sink dsn %q: mqtt topic must not contain publish wildcards", redactedURL(u))
+	}
+
+	q, err := parseQuery(u, knownMQTTKeys)
+	if err != nil {
+		return nil, err
+	}
+	values := u.Query()
+
+	qos := byte(1)
+	if v := values.Get("qos"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 || n > 2 {
+			return nil, fmt.Errorf("sink dsn %q: invalid qos=%q (want 0, 1, or 2)", redactedURL(u), v)
+		}
+		qos = byte(n)
+	}
+
+	retained := false
+	if v := values.Get("retained"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return nil, fmt.Errorf("sink dsn %q: invalid retained=%q (want true or false)", redactedURL(u), v)
+		}
+		retained = b
+	}
+
+	clientID := values.Get("client_id")
+	if clientID == "" {
+		clientID = defaultMQTTClientID()
+	}
+
+	username := u.User.Username()
+	password, _ := u.User.Password()
+	t, err := newMQTTTransport(mqttTransportConfig{
+		BrokerURL: "tcp://" + u.Host,
+		Username:  username,
+		Password:  password,
+		ClientID:  clientID,
+		Timeout:   q.Timeout,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	name := q.Name
+	if name == "" {
+		name = u.Host + "/" + baseTopic
+	}
+	return NewMQTTSink(name, baseTopic, qos, retained, t, buildRetryConfig(q)), nil
+}
+
 // parsedQuery holds all DSN query parameters after validation.
 type parsedQuery struct {
 	Name        string
@@ -197,7 +290,7 @@ func parseQuery(u *url.URL, allowed map[string]struct{}) (parsedQuery, error) {
 	q := u.Query()
 	for key := range q {
 		if _, ok := allowed[key]; !ok {
-			return parsedQuery{}, fmt.Errorf("sink dsn %q: unknown query parameter %q", u.String(), key)
+			return parsedQuery{}, fmt.Errorf("sink dsn %q: unknown query parameter %q", redactedURL(u), key)
 		}
 	}
 
@@ -213,7 +306,7 @@ func parseQuery(u *url.URL, allowed map[string]struct{}) (parsedQuery, error) {
 		case "insecure", "skipverify", "skip-verify":
 			out.TLSMode = tlsInsecureSkipVerify
 		default:
-			return parsedQuery{}, fmt.Errorf("sink dsn %q: invalid tls=%q", u.String(), v)
+			return parsedQuery{}, fmt.Errorf("sink dsn %q: invalid tls=%q", redactedURL(u), v)
 		}
 	}
 	if v := q.Get("ca"); v != "" {
@@ -222,14 +315,14 @@ func parseQuery(u *url.URL, allowed map[string]struct{}) (parsedQuery, error) {
 	for _, h := range q["header"] {
 		k, v, ok := strings.Cut(h, ":")
 		if !ok {
-			return parsedQuery{}, fmt.Errorf("sink dsn %q: header %q must be key:value", u.String(), h)
+			return parsedQuery{}, fmt.Errorf("sink dsn %q: header %q must be key:value", redactedURL(u), h)
 		}
 		out.Headers[strings.TrimSpace(k)] = strings.TrimSpace(v)
 	}
 	if v := q.Get("timeout"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
-			return parsedQuery{}, fmt.Errorf("sink dsn %q: timeout=%q: %w", u.String(), v, err)
+			return parsedQuery{}, fmt.Errorf("sink dsn %q: timeout=%q: %w", redactedURL(u), v, err)
 		}
 		out.Timeout = d
 	}
@@ -238,38 +331,45 @@ func parseQuery(u *url.URL, allowed map[string]struct{}) (parsedQuery, error) {
 		case "gzip", "none":
 			out.compression = strings.ToLower(v)
 		default:
-			return parsedQuery{}, fmt.Errorf("sink dsn %q: invalid compression=%q (want gzip or none)", u.String(), v)
+			return parsedQuery{}, fmt.Errorf("sink dsn %q: invalid compression=%q (want gzip or none)", redactedURL(u), v)
 		}
 	}
 	if v := q.Get("keepalive"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
-			return parsedQuery{}, fmt.Errorf("sink dsn %q: keepalive=%q: %w", u.String(), v, err)
+			return parsedQuery{}, fmt.Errorf("sink dsn %q: keepalive=%q: %w", redactedURL(u), v, err)
 		}
 		out.Keepalive = d
 	}
 	if v := q.Get("retry_initial"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
-			return parsedQuery{}, fmt.Errorf("sink dsn %q: retry_initial=%q: %w", u.String(), v, err)
+			return parsedQuery{}, fmt.Errorf("sink dsn %q: retry_initial=%q: %w", redactedURL(u), v, err)
 		}
 		out.RetryInitial = d
 	}
 	if v := q.Get("retry_max_interval"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
-			return parsedQuery{}, fmt.Errorf("sink dsn %q: retry_max_interval=%q: %w", u.String(), v, err)
+			return parsedQuery{}, fmt.Errorf("sink dsn %q: retry_max_interval=%q: %w", redactedURL(u), v, err)
 		}
 		out.RetryMaxInterval = d
 	}
 	if v := q.Get("retry_max_elapsed"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
-			return parsedQuery{}, fmt.Errorf("sink dsn %q: retry_max_elapsed=%q: %w", u.String(), v, err)
+			return parsedQuery{}, fmt.Errorf("sink dsn %q: retry_max_elapsed=%q: %w", redactedURL(u), v, err)
 		}
 		out.RetryMaxElapsed = d
 	}
 	return out, nil
+}
+
+func redactedURL(u *url.URL) string {
+	if u == nil {
+		return ""
+	}
+	return u.Redacted()
 }
 
 func buildRetryConfig(q parsedQuery) retryConfig {

@@ -184,3 +184,93 @@ func TestParseDSN_TLSVariants(t *testing.T) {
 		})
 	}
 }
+
+func TestParseDSN_MQTTDefaults(t *testing.T) {
+	s, err := ParseDSN("mqtt://user:pass@broker.example:1883/otel")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer s.Shutdown(context.Background())
+
+	ms, ok := s.(*MQTTSink)
+	if !ok {
+		t.Fatalf("expected *MQTTSink, got %T", s)
+	}
+	if ms.Name() != "broker.example:1883/otel" {
+		t.Errorf("Name = %q, want broker.example:1883/otel", ms.Name())
+	}
+	if ms.baseTopic != "otel" {
+		t.Errorf("base topic = %q, want otel", ms.baseTopic)
+	}
+	if ms.qos != 1 {
+		t.Errorf("qos = %d, want 1", ms.qos)
+	}
+	if ms.retained {
+		t.Errorf("retained = true, want false")
+	}
+}
+
+func TestParseDSN_MQTTFullOptions(t *testing.T) {
+	s, err := ParseDSN("mqtt://broker.example:1883/telemetry/harness?name=broker-a&qos=2&retained=true&client_id=steeplechase-test&timeout=2s&retry_initial=10ms&retry_max_interval=20ms&retry_max_elapsed=30ms")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer s.Shutdown(context.Background())
+
+	ms := s.(*MQTTSink)
+	if ms.Name() != "broker-a" {
+		t.Errorf("Name = %q, want broker-a", ms.Name())
+	}
+	if ms.baseTopic != "telemetry/harness" {
+		t.Errorf("base topic = %q, want telemetry/harness", ms.baseTopic)
+	}
+	if ms.qos != 2 {
+		t.Errorf("qos = %d, want 2", ms.qos)
+	}
+	if !ms.retained {
+		t.Errorf("retained = false, want true")
+	}
+	if ms.retry.Initial != 10*time.Millisecond {
+		t.Errorf("retry initial = %v, want 10ms", ms.retry.Initial)
+	}
+	if ms.retry.MaxElapsed != 30*time.Millisecond {
+		t.Errorf("retry max elapsed = %v, want 30ms", ms.retry.MaxElapsed)
+	}
+}
+
+func TestParseDSN_MQTTInvalidTopic(t *testing.T) {
+	tests := []string{
+		"mqtt://broker.example:1883",
+		"mqtt://broker.example:1883/",
+		"mqtt://broker.example:1883/otel/+",
+		"mqtt://broker.example:1883/otel/%23",
+		"mqtt://broker.example:1883/otel#fragment",
+	}
+	for _, dsn := range tests {
+		t.Run(dsn, func(t *testing.T) {
+			if _, err := ParseDSN(dsn); err == nil {
+				t.Fatal("expected error for invalid MQTT topic")
+			}
+		})
+	}
+}
+
+func TestParseDSN_MQTTInvalidQOS(t *testing.T) {
+	_, err := ParseDSN("mqtt://broker.example:1883/otel?qos=3")
+	if err == nil {
+		t.Fatal("expected error for invalid MQTT QoS")
+	}
+}
+
+func TestParseDSN_MQTTRedactsPasswordInErrors(t *testing.T) {
+	_, err := ParseDSN("mqtt://user:supersecret@broker.example:1883/otel?unknown=yes")
+	if err == nil {
+		t.Fatal("expected error for unknown query key")
+	}
+	if strings.Contains(err.Error(), "supersecret") {
+		t.Fatalf("error leaked password: %v", err)
+	}
+	if !strings.Contains(err.Error(), "xxxxx") {
+		t.Fatalf("error should contain redacted password marker, got: %v", err)
+	}
+}

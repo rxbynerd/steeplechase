@@ -188,3 +188,23 @@ func TestBuildPipeline_GroupedModeOnlyWrapsStdoutLeaves(t *testing.T) {
 		t.Errorf("expected exactly one RunBlockSink-wrapped leaf, got %d", wrappedCount)
 	}
 }
+
+func TestBuildPipeline_RedactsCredentialedDSNInErrors(t *testing.T) {
+	rec := metrics.NewRecorder(prometheus.NewRegistry())
+	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+	cfg, err := parseStdoutFormat("line", 5*time.Minute, 10000)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	_, _, err = buildPipeline([]string{"mqtt://user:supersecret@broker.example:1883/otel?unknown=yes"}, rec, logger, cfg)
+	if err == nil {
+		t.Fatal("expected buildPipeline error")
+	}
+	if strings.Contains(err.Error(), "supersecret") {
+		t.Fatalf("error leaked password: %v", err)
+	}
+	if !strings.Contains(err.Error(), "xxxxx") {
+		t.Fatalf("error should contain redacted password marker, got: %v", err)
+	}
+}
