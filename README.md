@@ -227,9 +227,24 @@ make build   # Build binary
 make all     # vet + test + build
 ```
 
-## Docker
+## Container image
+
+Published to GitHub Packages as `ghcr.io/rxbynerd/steeplechase`:
+
+| Tag | Source |
+| --- | --- |
+| `latest`, `X.Y.Z`, `X.Y` | `v*` release tags |
+| `edge`, `main`, `sha-<short>` | every push to `main` |
+
+`linux/amd64` and `linux/arm64` are both built.
 
 ```bash
-docker build -t steeplechase .
-docker run -p 4317:4317 -p 4318:4318 -p 9090:9090 steeplechase
+podman run -p 4317:4317 -p 4318:4318 -p 9090:9090 \
+  ghcr.io/rxbynerd/steeplechase:latest --sink stdout
+```
+
+Building locally:
+
+```bash
+podman build -f Containerfile -t steeplechase .
 ```
