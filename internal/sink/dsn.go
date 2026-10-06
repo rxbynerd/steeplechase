@@ -24,6 +24,7 @@ import (
 //	ca=<path>                 custom CA bundle (PEM)
 //	header=<k>:<v>            outbound header, repeatable
 //	timeout=<duration>        per-call deadline (default 10s)
+//	encoding=proto|json       http only, default proto
 //	compression=gzip|none     grpc default gzip, http default none
 //	retry_initial=<duration>  first backoff (default 500ms)
 //	retry_max_interval=<dur>  cap on any single backoff (default 10s)
@@ -90,6 +91,7 @@ var knownGRPCKeys = map[string]struct{}{
 
 // knownHTTPKeys is the closed set for the http sink.
 var knownHTTPKeys = map[string]struct{}{
+	"encoding":           {},
 	"name":               {},
 	"tls":                {},
 	"ca":                 {},
@@ -165,6 +167,7 @@ func parseHTTPDSN(u *url.URL) (Sink, error) {
 
 	cfg := httpTransportConfig{
 		BaseURL:     base.String(),
+		Encoding:    q.Encoding,
 		TLS:         q.TLSMode,
 		CABundle:    q.CABundle,
 		Headers:     q.Headers,
@@ -255,6 +258,7 @@ func parseMQTTDSN(u *url.URL) (Sink, error) {
 // parsedQuery holds all DSN query parameters after validation.
 type parsedQuery struct {
 	Name        string
+	Encoding    string
 	TLSMode     tlsMode
 	CABundle    string
 	Headers     map[string]string
@@ -333,6 +337,12 @@ func parseQuery(u *url.URL, allowed map[string]struct{}) (parsedQuery, error) {
 		default:
 			return parsedQuery{}, fmt.Errorf("sink dsn %q: invalid compression=%q (want gzip or none)", redactedURL(u), v)
 		}
+	}
+	if values, ok := q["encoding"]; ok {
+		if len(values) != 1 || (values[0] != "proto" && values[0] != "json") {
+			return parsedQuery{}, fmt.Errorf("sink dsn %q: encoding must be proto or json", redactedURL(u))
+		}
+		out.Encoding = values[0]
 	}
 	if v := q.Get("keepalive"); v != "" {
 		d, err := time.ParseDuration(v)

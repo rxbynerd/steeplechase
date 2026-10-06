@@ -101,6 +101,7 @@ Query parameters (all optional):
 | `name` | `host:port` | Label used in logs and Prometheus metrics |
 | `tls` | off for grpc, on for https | `true`, `false`, or `insecure` (skip verify) |
 | `ca` | — | Path to a PEM CA bundle |
+| `encoding` | `proto` | HTTP/HTTPS only: `proto` (binary protobuf) or `json` (OTLP JSON) |
 | `header` | — | Outbound header, format `key:value`; repeatable |
 | `timeout` | `10s` | Per-call deadline |
 | `compression` | `gzip` (grpc), `none` (http) | `gzip` or `none` |
@@ -111,6 +112,18 @@ Query parameters (all optional):
 | `qos` | `1` | MQTT publish QoS: `0`, `1`, or `2` |
 | `retained` | `false` | MQTT retained publish flag |
 | `client_id` | generated | MQTT client identifier |
+
+HTTP sinks default to binary protobuf. Add `encoding=json` to send OTLP JSON
+with `Content-Type: application/json`; no Content-Type header override is needed.
+gRPC sinks continue to use protobuf and reject the `encoding` option.
+
+```sh
+./bin/steeplechase --sink 'otlp+https://ingestor.example.com?encoding=json&header=Authorization:Bearer%20TOKEN&header=User-Agent:steeplechase'
+```
+
+Header values must be URL-encoded (for example, `%20` for a space and `%2B`
+for a literal `+`). All signals are forwarded, using `/v1/logs`, `/v1/metrics`,
+and `/v1/traces` under the supplied base URL.
 
 Unknown query keys cause startup to fail loudly, so typos become hard errors instead of silently-dropped configuration.
 
