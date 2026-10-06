@@ -27,6 +27,7 @@ type httpTransportConfig struct {
 	CABundle    string            // path to PEM file, optional
 	Headers     map[string]string // merged into every request
 	Timeout     time.Duration     // per-request timeout on the http.Client
+	Encoding    string            // "proto" (default) or "json"
 	Compression string            // "gzip" or ""
 }
 
@@ -39,6 +40,7 @@ type httpTransport struct {
 	tracesURL   string
 	headers     map[string]string
 	compression string
+	encoding    string
 }
 
 // newHTTPTransport builds an httpTransport from the given config. BaseURL may
@@ -88,6 +90,7 @@ func newHTTPTransport(cfg httpTransportConfig) (*httpTransport, error) {
 		tracesURL:   base.String() + "/v1/traces",
 		headers:     cfg.Headers,
 		compression: cfg.Compression,
+		encoding:    cfg.Encoding,
 	}, nil
 }
 
@@ -139,7 +142,15 @@ func (t *httpTransport) Close(_ context.Context) error {
 // post marshals the given proto message and POSTs it to url. Handles gzip
 // compression, custom headers, and response classification.
 func (t *httpTransport) post(ctx context.Context, url string, msg proto.Message) error {
-	body, err := proto.Marshal(msg)
+	var body []byte
+	var err error
+	contentType := "application/x-protobuf"
+	if t.encoding == "json" {
+		body, err = marshalOTLPJSON(msg)
+		contentType = "application/json"
+	} else {
+		body, err = proto.Marshal(msg)
+	}
 	if err != nil {
 		return permanent(fmt.Errorf("marshal: %w", err))
 	}
@@ -161,7 +172,7 @@ func (t *httpTransport) post(ctx context.Context, url string, msg proto.Message)
 	if err != nil {
 		return permanent(fmt.Errorf("new request: %w", err))
 	}
-	req.Header.Set("Content-Type", "application/x-protobuf")
+	req.Header.Set("Content-Type", contentType)
 	if t.compression == "gzip" {
 		req.Header.Set("Content-Encoding", "gzip")
 	}
